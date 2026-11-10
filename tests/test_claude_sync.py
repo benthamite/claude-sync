@@ -19,7 +19,7 @@ import unittest
 import zipfile
 
 SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "claude-sync")
-ORIGIN = "chrome-extension://digbgfehhflmjfbgoehmjfpokokfobjk"
+ORIGIN = "chrome-extension://mfoglmpaedcenmkbdclbjljncebkflal"
 ROOT = "00000000-0000-4000-8000-000000000000"
 CID = "11111111-2222-4333-8444-555555555555"
 ORG = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"

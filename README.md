@@ -58,9 +58,12 @@ its organization.
    To start it at login on macOS, adapt `contrib/claude-sync.plist` (the
    comments inside say how). On Linux, a systemd user service running the same
    command works.
-3. **Load the extension:** open `chrome://extensions`, turn on Developer mode,
-   click *Load unpacked*, and choose the `extension/` folder. Use the Chrome
-   profile in which you are logged in to claude.ai.
+3. **Install the extension** from the
+   [Chrome Web Store](https://chromewebstore.google.com/detail/mfoglmpaedcenmkbdclbjljncebkflal),
+   in the Chrome profile in which you are logged in to claude.ai. To run the
+   code in your clone instead (say, to change it), open `chrome://extensions`,
+   turn on Developer mode, click *Load unpacked* and choose the `extension/`
+   folder; both installs have the same ID, so use one or the other.
 4. **Sync:** open claude.ai, or click the extension's toolbar icon and then
    *Sync now*. The first run downloads every conversation, about one a second.
    Progress continues across runs.
@@ -125,7 +128,7 @@ the file to resume.
   page. Only unpacked installs do this; Chrome updates a Web Store install.
 - **Listener** (`bin/claude-sync`): a dependency-free Python script bound to
   `127.0.0.1`. It only accepts writes from the extension's fixed origin
-  (`chrome-extension://digbgfehhflmjfbgoehmjfpokokfobjk`, pinned by the `key`
+  (`chrome-extension://mfoglmpaedcenmkbdclbjljncebkflal`, pinned by the `key`
   in the manifest), writes `raw/`, `index.json` and `cowork/sessions.json`,
   commits them, and renders.
 

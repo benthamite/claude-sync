@@ -78,7 +78,7 @@ PAUSED = os.path.join(STATE_DIR, "paused")
 
 PORT = 8767
 # Fixed by the "key" in extension/manifest.json; only this extension may push.
-EXTENSION_ORIGIN = "chrome-extension://digbgfehhflmjfbgoehmjfpokokfobjk"
+EXTENSION_ORIGIN = "chrome-extension://mfoglmpaedcenmkbdclbjljncebkflal"
 
 # Tool results and attachment contents longer than this are cut in rendered
 # files; the raw JSON keeps them whole.
