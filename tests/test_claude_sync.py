@@ -77,7 +77,8 @@ def conversation(cid=CID, name="Test chat", updated="2026-10-03T15:00:00.123456Z
             ], "2026-10-03T14:00:10Z"),
             msg("m2b", "m1", "assistant", [text("abandoned branch")], "2026-10-03T14:00:09Z"),
             msg("m3", "m2", "human", [text("Thanks")], "2026-10-03T14:01:00Z",
-                attachments=[{"file_name": "notes.txt", "extracted_content": "attached text"}],
+                attachments=[{"file_name": "notes.txt", "extracted_content": "attached text"},
+                             {"file_name": "", "file_type": "txt", "extracted_content": "pasted"}],
                 files=[{"file_name": "chart.png", "file_kind": "blob"}]),
             msg("m4", "m3", "assistant", [text("You're welcome.")], "2026-10-03T14:01:05Z"),
         ],
@@ -163,6 +164,9 @@ class RenderMarkdownTests(unittest.TestCase):
         md = self.render()
         self.assertIn("**Attachment:** notes.txt\n\n```\nattached text\n```", md)
         self.assertIn("**File:** chart.png", md)
+
+    def test_pasted_text_is_labelled_as_such(self):
+        self.assertIn("**Pasted text**\n\n```\npasted\n```", self.render())
 
     def test_export_without_tree_renders_in_time_order(self):
         conv = export_conversation()

@@ -270,7 +270,9 @@ def attachments_markdown(msg: dict) -> list:
     for a in msg.get("attachments") or []:
         if not isinstance(a, dict):
             continue
-        part = f"**Attachment:** {a.get('file_name') or 'unnamed'}"
+        # Text pasted into the prompt arrives as an attachment with no name.
+        part = (f"**Attachment:** {a['file_name']}" if a.get("file_name")
+                else "**Pasted text**")
         if (a.get("extracted_content") or "").strip():
             part += "\n\n" + shortened_block(a["extracted_content"])
         out.append(part)
