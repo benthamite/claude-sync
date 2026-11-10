@@ -1,0 +1,840 @@
+#!/usr/bin/env python3
+"""Keep a local, git-versioned copy of your claude.ai conversations.
+
+Subcommands:
+  serve     Run the localhost listener the browser extension pushes to.
+  import    Import claude.ai's official data export (zip or unpacked folder).
+  render    Re-render every stored conversation (after changing the format).
+  status    Show the last sync and archive counts.
+
+Raw conversation JSON in the data directory is the source of truth and is
+committed to a local git repo there after each sync. Markdown (default) or Org
+files are generated from it and can be rebuilt at any time with `render`.
+
+Settings come from ~/.config/claude-sync/config.json (or the file named by
+CLAUDE_SYNC_CONFIG). All keys are optional:
+  format      "markdown" (default) or "org" (Org needs pandoc)
+  output_dir  where rendered files go (default: <data_dir>/<format>)
+  data_dir    raw JSON and index (default: data/ next to bin/)
+  state_dir   last-sync record and pause file (default: ~/.local/state/claude-sync)
+  orgs        UUIDs of the organizations to sync (default: every one with chats)
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import unicodedata
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
+
+# ----------------------------------------------------------------- config
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG_PATH = os.environ.get("CLAUDE_SYNC_CONFIG") or os.path.expanduser(
+    "~/.config/claude-sync/config.json")
+FORMATS = {"markdown": ".md", "org": ".org"}
+CONFIG_KEYS = {"format", "output_dir", "data_dir", "state_dir", "orgs"}
+
+
+def load_config(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        config = json.load(f)
+    unknown = set(config) - CONFIG_KEYS
+    if unknown:
+        sys.exit(f"{path}: unknown setting(s) {sorted(unknown)}; known: {sorted(CONFIG_KEYS)}")
+    if config.get("format", "markdown") not in FORMATS:
+        sys.exit(f"{path}: format must be one of {sorted(FORMATS)}")
+    orgs = config.get("orgs")
+    if orgs is not None and not (isinstance(orgs, list) and orgs
+                                 and all(isinstance(o, str) for o in orgs)):
+        sys.exit(f"{path}: orgs must be a non-empty list of organization UUIDs")
+    return config
+
+
+CONFIG = load_config(CONFIG_PATH)
+FORMAT = CONFIG.get("format", "markdown")
+DATA = os.path.expanduser(CONFIG.get("data_dir") or os.path.join(REPO, "data"))
+OUTPUT = os.path.expanduser(CONFIG.get("output_dir") or os.path.join(DATA, FORMAT))
+STATE_DIR = os.path.expanduser(CONFIG.get("state_dir") or "~/.local/state/claude-sync")
+RAW = os.path.join(DATA, "raw")
+INDEX = os.path.join(DATA, "index.json")
+COWORK = os.path.join(DATA, "cowork", "sessions.json")
+LAST_SYNC = os.path.join(STATE_DIR, "last-sync.json")
+PAUSED = os.path.join(STATE_DIR, "paused")
+
+PORT = 8767
+# Fixed by the "key" in extension/manifest.json; only this extension may push.
+EXTENSION_ORIGIN = "chrome-extension://digbgfehhflmjfbgoehmjfpokokfobjk"
+
+# Tool results and attachment contents longer than this are cut in rendered
+# files; the raw JSON keeps them whole.
+SHORTEN_AT = 2000
+
+# Fields the conversation list reports that can change without bumping the
+# conversation's updated_at; update_listing() applies them.
+LISTING_FIELDS = ("name", "org_name", "is_starred", "is_archived", "project_uuid", "project")
+
+LOCK = threading.Lock()
+
+# The extension's code files, hashed the same way by codeHash() in
+# extension/background.js. The extension reports the hash of the code it has
+# loaded; comparing it with the files on disk shows a stale extension, which
+# then reloads itself. Keep this list identical to CODE_FILES there.
+EXTENSION_DIR = os.path.join(REPO, "extension")
+EXTENSION_CODE_FILES = ["manifest.json", "background.js", "content.js", "popup.html", "popup.js"]
+
+
+def extension_code_hash() -> str | None:
+    """Hash of the extension code on disk, or None outside a repo checkout."""
+    lines = []
+    for name in EXTENSION_CODE_FILES:
+        path = os.path.join(EXTENSION_DIR, name)
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            lines.append(f"{name}\n{hashlib.sha256(f.read()).hexdigest()}\n")
+    return hashlib.sha256("".join(lines).encode()).hexdigest()
+
+
+# ---------------------------------------------------------------- helpers
+
+FRACTION = re.compile(r"\.(\d+)")
+
+
+def to_epoch(value) -> float:
+    """Normalize claude.ai timestamps (ISO strings, usually UTC with Z) to epoch."""
+    if value is None or value == "":
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().replace("Z", "+00:00")
+    # Python 3.9's fromisoformat accepts only 3 or 6 fractional digits.
+    s = FRACTION.sub(lambda m: "." + (m.group(1) + "000000")[:6], s, count=1)
+    d = dt.datetime.fromisoformat(s)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=dt.timezone.utc)
+    return d.timestamp()
+
+
+def latest(*values):
+    """The latest of several timestamps, as given; None if all are empty."""
+    values = [v for v in values if v]
+    return max(values, key=to_epoch) if values else None
+
+
+def now_iso() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def org_ts(epoch: float) -> str:
+    return dt.datetime.fromtimestamp(epoch).strftime("[%Y-%m-%d %a %H:%M]")
+
+
+def iso_ts(epoch: float) -> str:
+    return dt.datetime.fromtimestamp(epoch).isoformat(timespec="seconds")
+
+
+def write_atomic(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def dump(obj) -> str:
+    return json.dumps(obj, indent=1, sort_keys=True, ensure_ascii=False) + "\n"
+
+
+def load_json(path: str, default):
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    return default
+
+
+def load_index() -> dict:
+    return load_json(INDEX, {})
+
+
+def save_index(index: dict) -> None:
+    write_atomic(INDEX, dump(index))
+
+
+def slugify(title: str) -> str:
+    s = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode()
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", s).strip("-").lower()
+    return s[:60].rstrip("-") or "untitled"
+
+
+def conv_id(conv: dict) -> str:
+    return conv["uuid"]
+
+
+def raw_path(cid: str) -> str:
+    if not re.fullmatch(r"[0-9A-Za-z-]+", cid):
+        raise ValueError(f"unexpected conversation id {cid!r}")
+    return os.path.join(RAW, f"{cid}.json")
+
+
+def require_pandoc() -> None:
+    if FORMAT == "org" and not shutil.which("pandoc"):
+        sys.exit("format \"org\" needs pandoc on PATH (https://pandoc.org/installing.html)")
+
+
+# --------------------------------------------------------- message content
+
+def fence(body: str, lang: str = "") -> str:
+    ticks = "`" * max(3, max((len(m) for m in re.findall(r"`{3,}", body)), default=0) + 1)
+    return f"{ticks}{lang}\n{body}\n{ticks}"
+
+
+def shorten(text: str) -> tuple:
+    """Cut long text for the rendered file. Return (text, characters cut)."""
+    if len(text) <= SHORTEN_AT:
+        return text, 0
+    return text[:SHORTEN_AT].rstrip(), len(text) - SHORTEN_AT
+
+
+def shortened_block(text: str) -> str:
+    body, cut = shorten(text)
+    out = fence(body)
+    if cut:
+        out += f"\n\n*({cut:,} more characters in the raw JSON)*"
+    return out
+
+
+def quote(text: str) -> str:
+    return "\n".join(f"> {line}" if line else ">" for line in text.split("\n"))
+
+
+def result_text(content) -> str:
+    """Flatten a tool result's content to plain text."""
+    if isinstance(content, str):
+        return content
+    out = []
+    for item in content or []:
+        if not isinstance(item, dict):
+            out.append(str(item))
+        elif item.get("type") == "text":
+            out.append(item.get("text") or "")
+        elif item.get("type") == "knowledge":   # a search hit: title and URL
+            out.append(" ".join(x for x in (item.get("title"), item.get("url")) if x))
+        else:
+            out.append(f"[{item.get('type')}]")
+    return "\n".join(out)
+
+
+def tool_input(value) -> str:
+    one_line = json.dumps(value, ensure_ascii=False)
+    return one_line if len(one_line) <= 200 else json.dumps(value, ensure_ascii=False, indent=1)
+
+
+def block_markdown(block: dict) -> str | None:
+    """Markdown for one content block of an assistant turn, or None to omit it."""
+    btype = block.get("type")
+    if btype == "text":
+        text = block.get("text") or ""
+        return text if text.strip() else None
+    if btype == "thinking":
+        text = block.get("thinking") or "\n\n".join(
+            s.get("summary", "") for s in block.get("summaries") or [] if isinstance(s, dict))
+        return quote("**Thinking**\n\n" + text.strip()) if text.strip() else None
+    if btype == "tool_use":
+        return f"**Tool call:** `{block.get('name')}`\n\n" + fence(tool_input(block.get("input")), "json")
+    if btype == "tool_result":
+        label = f"**Tool result:** `{block.get('name')}`" if block.get("name") else "**Tool result**"
+        if block.get("is_error"):
+            label += " (error)"
+        text = result_text(block.get("content"))
+        return label + ("\n\n" + shortened_block(text) if text.strip() else " (empty)")
+    return f"[unrendered content type: {btype}]"
+
+
+def attachments_markdown(msg: dict) -> list:
+    out = []
+    for a in msg.get("attachments") or []:
+        if not isinstance(a, dict):
+            continue
+        part = f"**Attachment:** {a.get('file_name') or 'unnamed'}"
+        if (a.get("extracted_content") or "").strip():
+            part += "\n\n" + shortened_block(a["extracted_content"])
+        out.append(part)
+    for f in msg.get("files") or []:
+        if isinstance(f, dict):
+            out.append(f"**File:** {f.get('file_name') or 'unnamed'}")
+    return out
+
+
+def message_parts(msg: dict) -> tuple:
+    """Return (literal, markdown) for one message.
+
+    The literal part is what the user typed, shown as typed; the markdown part
+    is everything else (Claude's reply, tool calls, attachments).
+    """
+    blocks = [b for b in msg.get("content") or [] if isinstance(b, dict)]
+    if not blocks and msg.get("text"):
+        blocks = [{"type": "text", "text": msg["text"]}]
+    if msg.get("sender") == "human":
+        literal = "\n\n".join(b.get("text") or "" for b in blocks if b.get("type") == "text").strip()
+        rest = [block_markdown(b) for b in blocks if b.get("type") != "text"]
+    else:
+        literal = ""
+        rest = [block_markdown(b) for b in blocks]
+    rest = [p for p in rest if p] + attachments_markdown(msg)
+    return literal, "\n\n".join(rest)
+
+
+def message_order(msg: dict) -> tuple:
+    return (msg.get("created_at") or "", msg.get("index") if isinstance(msg.get("index"), int) else 0)
+
+
+def current_branch(conv: dict) -> list:
+    """The messages on the branch the app shows, oldest first.
+
+    Walks parent_message_uuid back from current_leaf_message_uuid. Edits and
+    retries make other branches, which stay in the raw JSON only. An export
+    without parent links is taken as one thread in time order.
+    """
+    msgs = [m for m in conv.get("chat_messages") or [] if isinstance(m, dict)]
+    if not msgs:
+        return []
+    if not any("parent_message_uuid" in m for m in msgs):
+        return sorted(msgs, key=message_order)
+    by_id = {m.get("uuid"): m for m in msgs}
+    node = conv.get("current_leaf_message_uuid")
+    if node not in by_id:
+        node = max(msgs, key=message_order).get("uuid")
+    path, seen = [], set()
+    while node in by_id and node not in seen:
+        seen.add(node)
+        path.append(by_id[node])
+        node = by_id[node].get("parent_message_uuid")
+    return list(reversed(path))
+
+
+def visible_blocks(conv: dict) -> list:
+    """Return (group key, heading, epoch, literal, markdown) for the rendered branch."""
+    blocks = []
+    for msg in current_branch(conv):
+        literal, md = message_parts(msg)
+        if not literal and not md:
+            continue
+        key, head = ("user", "User") if msg.get("sender") == "human" else ("assistant", "Claude")
+        blocks.append((key, head, to_epoch(msg.get("created_at")), literal, md))
+    return blocks
+
+
+# ---------------------------------------------------------- markdown output
+
+FENCE_OPEN = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+ATX_HEADING = re.compile(r"^(#{1,6})(\s)")
+
+
+def shift_headings(markdown: str, by: int) -> str:
+    """Demote ATX headings outside code fences so they nest under turns."""
+    out, fence_marker = [], None
+    for line in markdown.split("\n"):
+        m = FENCE_OPEN.match(line)
+        if m:
+            marker = m.group(1)
+            if fence_marker is None:
+                fence_marker = marker
+            elif marker[0] == fence_marker[0] and len(marker) >= len(fence_marker):
+                fence_marker = None
+        elif fence_marker is None:
+            line = ATX_HEADING.sub(lambda h: "#" * min(6, len(h.group(1)) + by) + h.group(2), line)
+        out.append(line)
+    return "\n".join(out)
+
+
+def markdown_literal(text: str) -> str:
+    """User turns are shown as typed; keep a leading # from becoming a heading."""
+    return re.sub(r"^(\s{0,3})#", r"\1\\#", text, flags=re.M)
+
+
+def chat_url(cid: str) -> str:
+    return f"https://claude.ai/chat/{cid}"
+
+
+def title_of(entry: dict) -> str:
+    return entry.get("name") or "Untitled"
+
+
+def render_markdown(conv: dict, entry: dict) -> str:
+    cid = conv_id(conv)
+    front = {
+        "title": title_of(entry),
+        "claude_id": cid,
+        "url": chat_url(cid),
+        "created": iso_ts(to_epoch(entry.get("created_at"))),
+        "updated": iso_ts(to_epoch(entry.get("updated_at"))),
+        "model": entry.get("model"),
+        "organization": entry.get("org_name"),
+        "organization_id": entry.get("org"),
+        "project": entry.get("project"),
+        "project_id": entry.get("project_uuid"),
+        "archived": entry.get("is_archived") or None,
+        "starred": entry.get("is_starred") or None,
+    }
+    out = ["---"]
+    out += [f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in front.items() if v is not None]
+    out += ["---", "", f"# {title_of(entry)}", ""]
+    prev_key = None
+    for key, head, created, literal, md in visible_blocks(conv):
+        if key != prev_key:
+            stamp = f" · {dt.datetime.fromtimestamp(created):%Y-%m-%d %H:%M}" if created else ""
+            out += [f"## {head}{stamp}", ""]
+            prev_key = key
+        if literal:
+            out += [markdown_literal(literal), ""]
+        if md:
+            out += [shift_headings(md, 2), ""]
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+# --------------------------------------------------------------- org output
+
+PANDOC_FROM = "markdown-smart-auto_identifiers+tex_math_single_backslash"
+SEPARATOR = "CLAUDESYNCSEPARATOR7F3A"
+
+
+def pandoc(markdown: str) -> str:
+    out = subprocess.run(
+        ["pandoc", "-f", PANDOC_FROM, "-t", "org", "--wrap=preserve",
+         "--shift-heading-level-by=1"],
+        input=markdown, capture_output=True, text=True, check=True)
+    return out.stdout
+
+
+def md_to_org_many(chunks: list) -> list:
+    """Convert markdown chunks to Org in one pandoc call.
+
+    Chunks are joined with a separator paragraph. If a chunk leaves a code
+    fence open, the separator gets swallowed and the split count is wrong;
+    then each chunk is converted on its own, which is slower but exact.
+    """
+    if not chunks:
+        return []
+    joined = f"\n\n{SEPARATOR}\n\n".join(chunks)
+    parts = re.split(rf"^{SEPARATOR}$", pandoc(joined), flags=re.M)
+    if len(parts) == len(chunks):
+        return [p.strip("\n") for p in parts]
+    return [pandoc(c).strip("\n") for c in chunks]
+
+
+def org_literal(text: str) -> str:
+    """User turns are shown verbatim, as claude.ai displays them."""
+    escaped = re.sub(r"^(\s*)([*]|#\+|,[*]|,#\+)", r"\1,\2", text, flags=re.M)
+    return f"#+begin_example\n{escaped}\n#+end_example"
+
+
+def render_org(conv: dict, entry: dict) -> str:
+    blocks = visible_blocks(conv)
+    converted = iter(md_to_org_many([b[4] for b in blocks if b[4]]))
+    bodies = []
+    for _, _, _, literal, md in blocks:
+        parts = [org_literal(literal)] if literal else []
+        if md:
+            parts.append(next(converted))
+        bodies.append("\n\n".join(parts))
+    cid = conv_id(conv)
+    out = [":PROPERTIES:"]
+    # An "org_mode_id" set by hand in index.json keeps Org ID links to this
+    # chat working across re-renders.
+    if entry.get("org_mode_id"):
+        out.append(f":ID:       {entry['org_mode_id']}")
+    out += [
+        f":CLAUDE_ID: {cid}",
+        f":CLAUDE_URL: {chat_url(cid)}",
+        f":CREATED: {org_ts(to_epoch(entry.get('created_at')))}",
+        f":UPDATED: {org_ts(to_epoch(entry.get('updated_at')))}",
+    ]
+    for prop, key in (("MODEL", "model"), ("ORGANIZATION", "org_name"), ("ORGANIZATION_ID", "org"),
+                      ("PROJECT", "project"), ("PROJECT_ID", "project_uuid")):
+        if entry.get(key):
+            out.append(f":{prop}: {entry[key]}")
+    if entry.get("is_archived"):
+        out.append(":ARCHIVED: t")
+    if entry.get("is_starred"):
+        out.append(":STARRED: t")
+    out += [":END:", f"#+title: {title_of(entry)}", ""]
+
+    prev_key = None
+    for (key, head, created, _, _), body in zip(blocks, bodies):
+        if key != prev_key:
+            stamp = f" {org_ts(created)}" if created else ""
+            out += [f"* {head}{stamp}", ""]
+            prev_key = key
+        out += [body, ""]
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+RENDERERS = {"markdown": render_markdown, "org": render_org}
+
+
+def render(conv: dict, entry: dict) -> str:
+    return RENDERERS[FORMAT](conv, entry)
+
+
+def output_relpath(entry: dict, cid: str) -> str:
+    created = dt.datetime.fromtimestamp(to_epoch(entry.get("created_at")))
+    return os.path.join(created.strftime("%Y"),
+                        f"{created:%Y-%m-%d}--{slugify(title_of(entry))}--{cid[:8]}"
+                        + FORMATS[FORMAT])
+
+
+# ------------------------------------------------------------------ store
+
+def ensure_data_repo() -> None:
+    """Create the data directory as a local git repo on first use."""
+    os.makedirs(RAW, exist_ok=True)
+    if not os.path.isdir(os.path.join(DATA, ".git")):
+        subprocess.run(["git", "init", "-q", DATA], check=True)
+    ignore = os.path.join(DATA, ".gitignore")
+    if not os.path.exists(ignore):
+        # Rendered output is regenerated from raw/, so it isn't versioned.
+        # No trailing slash: the output folder may be a symlink.
+        write_atomic(ignore, "".join(f"/{f}\n" for f in FORMATS))
+
+
+def store(conv: dict, meta: dict | None, index: dict, force: bool = False) -> bool:
+    """Save one conversation's raw JSON and rendered file. Return True if written.
+
+    `meta` is the conversation's entry in the app's conversation list, plus
+    its organization; `conv` is the conversation as fetched (or exported),
+    with claude-sync's own fields under "_claude_sync".
+    """
+    cid = conv_id(conv)
+    meta = meta or {}
+    old = index.get(cid)
+    ours = conv.get("_claude_sync") or {}
+    updated = latest(conv.get("updated_at"), meta.get("updated_at"),
+                     old.get("updated_at") if old and force else None)
+    # The app's copy replaces an imported one even when no newer: it has the
+    # full message tree, which the export lacks.
+    upgrade = bool(old) and old.get("source") == "export" and ours.get("source", "api") == "api"
+    if old and to_epoch(old["updated_at"]) >= to_epoch(updated) and not force and not upgrade:
+        return False
+
+    def field(name):
+        # Freshest source first: the list sent with this sync, then a newly
+        # fetched conversation, then the index (kept current by
+        # update_listing), then a re-rendered raw JSON, whose copy dates from
+        # its fetch and misses changes that don't bump updated_at (renames,
+        # stars, moves between projects).
+        if name in meta:
+            return meta[name]
+        if not force and name in conv:
+            return conv[name]
+        if old and name in old:
+            return old[name]
+        return conv.get(name)
+
+    entry = {
+        "org": meta.get("org") or (old or {}).get("org") or ours.get("org"),
+        "org_name": field("org_name"),
+        "name": field("name") or "",
+        "created_at": conv.get("created_at") or meta.get("created_at"),
+        "updated_at": updated,
+        "model": conv.get("model") or meta.get("model"),
+        "project_uuid": field("project_uuid"),
+        "project": field("project"),
+        "is_starred": bool(field("is_starred")),
+        "is_archived": bool(field("is_archived")),
+        "source": ours.get("source", "api"),
+        "fetched_at": old.get("fetched_at") if old and force else now_iso(),
+    }
+    entry["file"] = output_relpath(entry, cid)
+    if old and old.get("org_mode_id"):
+        entry["org_mode_id"] = old["org_mode_id"]
+    write_atomic(raw_path(cid), dump(conv))
+    write_atomic(os.path.join(OUTPUT, entry["file"]), render(conv, entry))
+    if old and old.get("file") and old["file"] != entry["file"]:
+        stale = os.path.join(OUTPUT, old["file"])
+        if os.path.exists(stale):
+            os.remove(stale)  # renamed chat; raw/ history keeps the old version
+    index[cid] = entry
+    return True
+
+
+def listing_meta(item: dict) -> dict:
+    return {k: item[k] for k in LISTING_FIELDS + ("org",) if k in item}
+
+
+def update_listing(listing: list, index: dict) -> list:
+    """Apply list-only changes (renames, stars, project moves) to stored chats."""
+    changed = []
+    for item in listing:
+        cid = item.get("uuid")
+        entry = index.get(cid)
+        if entry and any(k in item and entry.get(k) != item[k] for k in LISTING_FIELDS):
+            with open(raw_path(cid), encoding="utf-8") as f:
+                conv = json.load(f)
+            store(conv, listing_meta(item), index, force=True)
+            changed.append(cid)
+    return changed
+
+
+def save_cowork(cowork: dict) -> bool:
+    """Write the latest Cowork session list. Return True if the list changed."""
+    old = load_json(COWORK, {})
+    new = {"fetched_at": now_iso(), "orgs": cowork.get("orgs") or [],
+           "sessions": cowork.get("sessions") or []}
+    write_atomic(COWORK, dump(new))
+    return (old.get("orgs"), old.get("sessions")) != (new["orgs"], new["sessions"])
+
+
+def git_commit(message: str, cowork_changed: bool = False) -> str | None:
+    paths = ["raw", "index.json"]
+    if cowork_changed:
+        # Only a changed list is committed, not each new fetched_at.
+        paths.append(os.path.join("cowork", "sessions.json"))
+    subprocess.run(["git", "-C", DATA, "add", "-A", *paths], check=True)
+    staged = subprocess.run(["git", "-C", DATA, "diff", "--cached", "--quiet"])
+    if staged.returncode == 0:
+        return None
+    # The pathspec keeps any other staged work out of sync commits.
+    subprocess.run(["git", "-C", DATA, "commit", "-q", "-m", message, "--", *paths], check=True)
+    return subprocess.run(["git", "-C", DATA, "rev-parse", "--short", "HEAD"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+# ----------------------------------------------------------------- server
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "claude-sync"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s %s\n" % (dt.datetime.now().isoformat(timespec="seconds"), fmt % args))
+
+    def _reply(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authorized(self) -> bool:
+        if os.path.exists(PAUSED):
+            self._reply(503, {"error": f"paused: remove {PAUSED} to resume"})
+            return False
+        origin = self.headers.get("Origin")
+        if origin == EXTENSION_ORIGIN:
+            return True
+        # Chrome omits Origin on the extension's GETs. Allowing that is safe:
+        # a web page's Origin-less request (no-cors) gets an opaque response
+        # it can't read, and GET changes nothing.
+        if origin is None and self.command == "GET":
+            return True
+        self.log_message("rejected %s %s from origin %r", self.command, self.path, origin)
+        self._reply(403, {"error": "forbidden origin"})
+        return False
+
+    def do_GET(self):
+        if self.path == "/health":
+            return self._reply(200, {"ok": True})
+        if not self._authorized():
+            return
+        url = urlsplit(self.path)
+        if url.path == "/state":
+            query = parse_qs(url.query)
+            loaded = (query.get("code") or [None])[0]
+            disk = extension_code_hash()
+            if loaded and disk and loaded != disk:
+                self.log_message("extension %s runs stale code (loaded %s, disk %s)",
+                                 (query.get("v") or ["?"])[0], loaded[:12], disk[:12])
+            with LOCK:
+                index = load_index()
+            # Imported chats count as never fetched, so the extension replaces
+            # them with the app's copy.
+            ids = {k: 0 if v.get("source") == "export" else to_epoch(v["updated_at"])
+                   for k, v in index.items()}
+            return self._reply(200, {"ids": ids,
+                                     "orgs": CONFIG.get("orgs"),
+                                     "extension_code": disk})
+        self._reply(404, {"error": "not found"})
+
+    def do_POST(self):
+        if not self._authorized():
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        payload = json.loads(self.rfile.read(length) or b"{}")
+        try:
+            if self.path == "/conversations":
+                with LOCK:
+                    index = load_index()
+                    written = 0
+                    for item in payload["items"]:
+                        conv = item["conversation"]
+                        conv["_claude_sync"] = {"org": item["org"], "source": "api"}
+                        meta = dict(item.get("meta") or {}, org=item["org"])
+                        written += store(conv, meta, index)
+                    save_index(index)
+                return self._reply(200, {"written": written})
+            if self.path == "/sync-done":
+                with LOCK:
+                    index = load_index()
+                    changed = update_listing(payload.get("listing") or [], index)
+                    save_index(index)
+                    cowork = payload.get("cowork")
+                    cowork_changed = save_cowork(cowork) if cowork is not None else False
+                    s = payload.get("summary") or {}
+                    commit = git_commit(
+                        f"sync: {s.get('fetched', 0)} fetched, {len(changed)} list changes"
+                        + (f", {len(cowork['sessions'])} Cowork sessions" if cowork_changed else ""),
+                        cowork_changed)
+                record = {"at": now_iso(), "summary": s, "listing_changes": len(changed),
+                          "commit": commit, "errors": payload.get("errors") or [],
+                          "extension": payload.get("extension")}
+                write_atomic(LAST_SYNC, json.dumps(record, indent=1) + "\n")
+                return self._reply(200, {"commit": commit})
+        except Exception as e:  # report to the extension, which shows a badge
+            self.log_message("error on %s: %r", self.path, e)
+            return self._reply(500, {"error": repr(e)})
+        self._reply(404, {"error": "not found"})
+
+
+def make_server(port: int) -> ThreadingHTTPServer:
+    require_pandoc()
+    ensure_data_repo()
+    os.makedirs(STATE_DIR, exist_ok=True)
+    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+
+
+def cmd_serve(args) -> None:
+    httpd = make_server(args.port)
+    print(f"listening on 127.0.0.1:{httpd.server_port}; writing {FORMAT} to {OUTPUT}",
+          file=sys.stderr, flush=True)
+    httpd.serve_forever()
+
+
+# ------------------------------------------------------------ import/render
+
+EXPORT_FILE = re.compile(r"(.*/)?conversations\.json")
+
+
+def read_export(paths: list) -> list:
+    """Conversations from export zips, unpacked folders or conversations.json files."""
+    convs = []
+    for path in paths:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as z:
+                for name in sorted(z.namelist()):
+                    if EXPORT_FILE.fullmatch(name):
+                        convs += json.loads(z.read(name))
+        elif os.path.isdir(path):
+            for root, _, files in sorted(os.walk(path)):
+                if "conversations.json" in files:
+                    with open(os.path.join(root, "conversations.json"), encoding="utf-8") as f:
+                        convs += json.load(f)
+        elif os.path.isfile(path):
+            with open(path, encoding="utf-8") as f:
+                convs += json.load(f)
+        else:
+            sys.exit(f"not found: {path}")
+    convs = [c for c in convs if isinstance(c, dict) and c.get("uuid")]
+    if not convs:
+        sys.exit(f"no conversations.json with conversations found in {', '.join(paths)}")
+    return convs
+
+
+def parallel_store(convs: list, index: dict, force: bool) -> int:
+    # Rendering dominates; index updates happen on the main thread afterwards.
+    def work(conv):
+        local = {conv_id(conv): index[conv_id(conv)]} if conv_id(conv) in index else {}
+        return local if store(conv, None, local, force) else None
+    n = 0
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+        for result in pool.map(work, convs):
+            if result:
+                index.update(result)
+                n += 1
+    return n
+
+
+def cmd_import(args) -> None:
+    require_pandoc()
+    ensure_data_repo()
+    convs = read_export(args.paths)
+    with LOCK:
+        index = load_index()
+        # The app's copy has the full message tree; never replace it with the
+        # export's. A later sync fetches anything changed since.
+        todo = [c for c in convs if (index.get(c["uuid"]) or {}).get("source") != "api"]
+        for conv in todo:
+            conv["_claude_sync"] = {"org": args.org, "source": "export"}
+        n = parallel_store(todo, index, force=False)
+        save_index(index)
+        commit = git_commit(f"import: {n} of {len(convs)} conversations from official export")
+    print(f"{len(convs)} in export, {n} new or newer, commit {commit}")
+
+
+def cmd_render(args) -> None:
+    require_pandoc()
+    with LOCK:
+        index = load_index()
+        convs = []
+        for cid in index:
+            with open(raw_path(cid), encoding="utf-8") as f:
+                convs.append(json.load(f))
+        n = parallel_store(convs, index, force=True)
+        save_index(index)
+    print(f"re-rendered {n} conversations as {FORMAT} in {OUTPUT}")
+
+
+def cmd_status(args) -> None:
+    index = load_index()
+    by_org = {}
+    for e in index.values():
+        key = (f"{e.get('org_name') or '?'} ({e['org']})" if e.get("org")
+               else "(organization unknown)")
+        by_org[key] = by_org.get(key, 0) + 1
+    print(f"{len(index)} conversations ({sum(e['is_archived'] for e in index.values())} archived)")
+    for org, n in sorted(by_org.items()):
+        print(f"  {n:6d}  {org}")
+    cowork = load_json(COWORK, None)
+    if cowork:
+        print(f"{len(cowork['sessions'])} Cowork sessions (listed {cowork['fetched_at']})")
+    print(f"format {FORMAT}, data {DATA}, output {OUTPUT}")
+    if os.path.exists(LAST_SYNC):
+        with open(LAST_SYNC) as f:
+            print("last sync:", f.read().strip())
+    else:
+        print("no sync recorded yet")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("serve")
+    s.add_argument("--port", type=int, default=PORT)
+    s.set_defaults(func=cmd_serve)
+    i = sub.add_parser("import")
+    i.add_argument("paths", nargs="+", metavar="EXPORT",
+                   help="export .zip, unpacked export folder or conversations.json")
+    i.add_argument("--org", help="UUID of the organization the export came from (recorded per chat)")
+    i.set_defaults(func=cmd_import)
+    sub.add_parser("render").set_defaults(func=cmd_render)
+    sub.add_parser("status").set_defaults(func=cmd_status)
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

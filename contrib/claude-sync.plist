@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- macOS LaunchAgent that keeps the claude-sync listener running.
+     Replace /PATH/TO/claude-sync and YOUR_USER, copy to
+     ~/Library/LaunchAgents/, then:
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/claude-sync.plist
+     Create ~/.local/state/claude-sync/ first so launchd can write the logs.
+     PATH must include git, and pandoc if you use the Org format. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>claude-sync</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/PATH/TO/claude-sync/bin/claude-sync</string>
+    <string>serve</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USER/.local/state/claude-sync/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USER/.local/state/claude-sync/launchd.err.log</string>
+</dict>
+</plist>
