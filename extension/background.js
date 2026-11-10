@@ -250,7 +250,11 @@ async function runSync(force = []) {
     // Ask the listener first, so a stopped or paused listener ends the run
     // before anything is requested from claude.ai.
     await stage('checking listener');
-    const loadedCode = await get('loadedCode');
+    // Only an unpacked install runs the code in the listener's repository;
+    // a store or policy install runs the store's copy and is updated by Chrome.
+    const installType = (await chrome.management.getSelf()).installType;
+    const unpacked = installType === 'development';
+    const loadedCode = unpacked ? await get('loadedCode') : null;
     const state = await server('GET', `/state?v=${VERSION}&code=${loadedCode || ''}`);
     const ids = state.ids;
     // The listener reports the hash of the extension code on disk. If it
@@ -258,7 +262,7 @@ async function runSync(force = []) {
     // Reload at most once per disk version, so a mismatch that a reload can't
     // fix (e.g. the extension loaded from another folder) fails loudly
     // instead of looping.
-    if (state.extension_code && loadedCode && state.extension_code !== loadedCode) {
+    if (unpacked && state.extension_code && loadedCode && state.extension_code !== loadedCode) {
       if ((await get('reloadedFor')) === state.extension_code) {
         throw new Error('extension code on disk differs from the loaded code even after a ' +
                         'reload; is the extension loaded from this repository?');
@@ -315,7 +319,8 @@ async function runSync(force = []) {
     const slim = listing.map(({uuid, org, org_name, name, is_starred, is_archived, project_uuid, project}) =>
       ({uuid, org, org_name, name, is_starred, is_archived, project_uuid, project}));
     await server('POST', '/sync-done', {listing: slim, summary, errors, cowork,
-                                        extension: {version: VERSION, code: loadedCode}});
+                                        extension: {version: VERSION, code: loadedCode,
+                                                    install_type: installType}});
     if (errors.length) error = `${errors.length} error(s); first: ${errors[0]}`;
     await set({lastSuccess: Date.now()});
   } catch (e) {

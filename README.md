@@ -122,7 +122,7 @@ the file to resume.
   the code it has loaded; the listener compares it with the files in
   `extension/` and logs a mismatch. The extension then reloads itself, so
   edits to its code take effect without clicking reload on the Extensions
-  page.
+  page. Only unpacked installs do this; Chrome updates a Web Store install.
 - **Listener** (`bin/claude-sync`): a dependency-free Python script bound to
   `127.0.0.1`. It only accepts writes from the extension's fixed origin
   (`chrome-extension://digbgfehhflmjfbgoehmjfpokokfobjk`, pinned by the `key`
@@ -167,8 +167,10 @@ stable:
 - **`~/.local/state/claude-sync/last-sync.json`**: the last completed sync:
   `at`, `summary` (`listed`, `fetched`, `cowork_sessions`),
   `listing_changes`, `commit` (or `null` if nothing changed), `errors` (a
-  list; empty when all went well) and `extension` (its version and code
-  hash). A sync that fails before it completes (e.g. when logged out) leaves
+  list; empty when all went well) and `extension` (`version`,
+  `install_type` as Chrome reports it, e.g. `development` for an unpacked
+  install, and `code`, the loaded code's hash, or `null` outside unpacked
+  installs). A sync that fails before it completes (e.g. when logged out) leaves
   the previous record in place, so a stale `at` means syncing has stopped.
 
 ## Limitations
