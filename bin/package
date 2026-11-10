@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Build the zip to upload to the Chrome Web Store: dist/claude-sync-<version>.zip.
+
+The zip holds extension/ as is, except that the manifest loses its "key":
+the store rejects an uploaded manifest that has one (it signs items with its
+own key). The key in the repo gives unpacked installs the store item's ID, so
+both kinds of install talk to the listener under the same origin.
+"""
+
+import json
+import os
+import zipfile
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EXTENSION = os.path.join(REPO, "extension")
+DIST = os.path.join(REPO, "dist")
+
+
+def main() -> None:
+    with open(os.path.join(EXTENSION, "manifest.json"), encoding="utf-8") as f:
+        manifest = json.load(f)
+    manifest.pop("key", None)
+    os.makedirs(DIST, exist_ok=True)
+    out = os.path.join(DIST, f"claude-sync-{manifest['version']}.zip")
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, dirs, files in os.walk(EXTENSION):
+            dirs.sort()
+            for name in sorted(files):
+                if name.startswith("."):
+                    continue
+                path = os.path.join(root, name)
+                rel = os.path.relpath(path, EXTENSION)
+                if rel == "manifest.json":
+                    z.writestr(rel, json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+                else:
+                    z.write(path, rel)
+    print(out)
+
+
+if __name__ == "__main__":
+    main()
