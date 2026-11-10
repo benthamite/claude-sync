@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "Claude Sync",
+  "version": "0.1.0",
+  "description": "Keeps a local, git-versioned copy of your claude.ai conversations via the claude-sync listener.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtVbfj0nbDyk5K2DGuYhbVWKV5SX1lchOt7+5jF7zhLCxkfD1FonoaJkJ8b7Jpo7XJ7vMQ86waxVBefTFpIgNz7kyxz+NlTdlAurqdOVMvtgFNQb6vEWnd2sMaZvpMF4+d7G0LdptlgWfhcB5Sulm1Uh06NwBWTxKDIHRCy4m3qQOIqknnU/Z2kwVM26ldPta3T+Fn2V59Sb3GPg+si884wmUCdLpesUDXgaPvtvdMTAUJFwtI24Iw0fqB9eyehu9+3f3RLnes+6vaD51rAIjSy0jxJeiym6sJlw4y+SAf8orzzm7jyBu2KYXQOH5bi2DWC4EJLrQx+XK9Ny8TmLo4QIDAQAB",
+  "permissions": [
+    "alarms",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://claude.ai/*",
+    "http://127.0.0.1:8767/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://claude.ai/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Claude Sync",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    },
+    "default_popup": "popup.html"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
