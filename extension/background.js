@@ -67,8 +67,28 @@ chrome.runtime.onInstalled.addListener(async () => {
 
 // Each stage write also refreshes the run's heartbeat and, being an extension
 // API call, keeps the service worker alive during long runs.
+let currentStage = '';
 async function stage(name) {
+  currentStage = name;
   await set({run: {stage: name, heartbeat: Date.now()}});
+}
+
+// Chrome also stops the worker when a fetch() response takes over 30 s to
+// arrive, and a claude.ai list request can take about that long. While one is
+// pending, refresh the stage every 10 s with the time waited, so the worker
+// keeps making API calls and a run that dies anyway shows how long it waited.
+async function awaitWithHeartbeat(promise) {
+  const label = currentStage;
+  const start = Date.now();
+  const timer = setInterval(() => {
+    stage(`${label} (waiting ${Math.round((Date.now() - start) / 1000)}s)`);
+  }, 10000);
+  try {
+    return await promise;
+  } finally {
+    clearInterval(timer);
+    if (currentStage !== label) await stage(label);
+  }
 }
 
 // Chrome stops a service worker after 30 s without extension events or API
@@ -110,20 +130,20 @@ async function server(method, path, body) {
 // A GET, or a POST of `body` as JSON.
 async function api(path, headers = {}, body = undefined) {
   for (let attempt = 0; ; attempt++) {
-    const r = await fetch(CLAUDE + path, {
+    const r = await awaitWithHeartbeat(fetch(CLAUDE + path, {
       method: body === undefined ? 'GET' : 'POST',
       headers: body === undefined ? headers : {...headers, 'Content-Type': 'application/json'},
       body: body === undefined ? undefined : JSON.stringify(body),
       credentials: 'include',
       signal: AbortSignal.timeout(120000),
-    });
+    }));
     if (r.status === 429 && attempt < 8) {
       const wait = Number(r.headers.get('Retry-After')) || 30 * (attempt + 1);
       await wakefulSleep(wait * 1000, `rate limited; waiting ${wait}s`);
       continue;
     }
     if (!r.ok) throw Object.assign(new Error(`${path.split('?')[0]}: HTTP ${r.status}`), {status: r.status});
-    return r.json();
+    return awaitWithHeartbeat(r.json());
   }
 }
 
@@ -353,7 +373,10 @@ async function syncDocuments(summary, errors) {
 }
 
 async function runSync(force = []) {
-  const errors = [];
+  // A run that died never reached the listener; report it with this one.
+  const died = await get('diedRun');
+  const errors = died ? [died] : [];
+  if (died) await set({diedRun: null});
   const summary = {listed: 0, fetched: 0, documents: 0, cowork_sessions: null};
   let error = null;
   let errorKind = null;
@@ -459,7 +482,7 @@ async function maybeSync(minIntervalMs, force = []) {
   if (run) {
     // The worker was stopped mid-run without reaching the end of runSync.
     const error = `previous run died at stage: ${run.stage}`;
-    await set({lastError: error, lastErrorKind: null, run: null});
+    await set({lastError: error, lastErrorKind: null, run: null, diedRun: error});
     await setBadge(error);
   }
   const lastFinished = (await get('lastFinished')) || 0;
