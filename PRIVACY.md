@@ -13,6 +13,8 @@ Using the claude.ai login already in your browser, the extension reads:
   content: messages, Claude's replies and thinking, tool calls and results,
   attachments' extracted text and file names, and the conversation's model
   and settings;
+- the Claude Docs your conversations create, edit or read: their titles,
+  creation dates and the text of their tabs;
 - the list of your Cowork sessions: titles, dates, message counts and the
   folders attached to them (not their content).
 
@@ -28,7 +30,7 @@ folder on your disk and commits it to a local git repository there.
 Claude Sync sends no data to its developer or to anyone else. It has no
 server, no analytics, no tracking and no advertising, and it does not sell,
 share or transfer your data. Nothing is sent to claude.ai except the
-ordinary requests your browser makes to read your own conversations.
+ordinary requests your browser makes to read your own conversations and docs.
 
 ## What it stores in the browser
 
@@ -46,4 +48,4 @@ README. Uninstalling the extension removes its browser storage.
 
 Questions: open an issue at <https://github.com/benthamite/claude-sync/issues>.
 
-Last updated: 10 November 2026.
+Last updated: 15 November 2026.

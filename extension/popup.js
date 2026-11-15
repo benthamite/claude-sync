@@ -16,6 +16,7 @@ async function render() {
     const s = lastSummary || {};
     $('state').textContent = lastFinished
       ? `Last sync OK (${fmt(lastFinished)}): ${s.fetched || 0} fetched of ${s.listed || 0}` +
+        `, ${s.documents || 0} document(s) updated` +
         (s.cowork_sessions != null ? `; ${s.cowork_sessions} Cowork sessions listed.` : '.')
       : 'No sync yet.';
   }

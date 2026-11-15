@@ -32,6 +32,8 @@ How it works:
   commits it to a local git repository, and renders one readable file per
   chat.
 • After the first backfill, each sync downloads only what changed.
+• Claude Docs that a chat creates or edits are saved too, at their current
+  version, and linked from the chat's file.
 • It also saves the list of your Cowork sessions and the folders attached to
   them.
 • If your login belongs to several organizations (say a personal one and a
@@ -72,8 +74,9 @@ them to a companion program on the user's own computer.
   open.
 - `storage`: keeps the extension's own status (time of the last sync, the
   last error) for the toolbar popup. No conversation content is stored.
-- Host permission `https://claude.ai/*`: reads the user's own conversations
-  and Cowork session list from claude.ai, with the user's existing login,
+- Host permission `https://claude.ai/*`: reads the user's own conversations,
+  the Claude Docs they create, edit or read, and the Cowork session list from
+  claude.ai, with the user's existing login,
   and runs a content script that only signals that a claude.ai page loaded,
   so a sync can start.
 - Host permission `http://127.0.0.1:8767/*`: hands the conversations to the

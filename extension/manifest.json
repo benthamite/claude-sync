@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Claude Sync",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Keeps a local, git-versioned copy of your claude.ai conversations via the claude-sync listener.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAlgizxsiRefD4U8vF0p6JXcIFFK17GIvCE1w9Zxomb6nJCCcXKB5ahE73jMCtOP579nlNvKnV5a79nGsWsvgdHg7UsGNskh/xr+RD8vIOh8rBHdNivCNYZ93p3tP0Gk7dBon9zjL66g5et6nEHtKvnuIIutHxui007cfu1vFUHl+N/G9WULBO/NUU9RqD07IjapiUL3csWLR8KWu+IqfliPkIeYNoUbwwV9LpgPHY+W/Xt7/L0rkFzd8+em924EDvMcTQs4HOKZhGu+fFAx3FRMkeoheVFoTZop2S8SYYNFLbmw3SWTKYKUkI6g7LaMmuWSX7aL8u+Zi+Ve++hykjVwIDAQAB",
   "permissions": [

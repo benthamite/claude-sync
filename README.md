@@ -6,8 +6,9 @@ Keep a local, always-current copy of your claude.ai conversations as Markdown
 A small Chrome extension uses your logged-in claude.ai session to fetch new
 and changed conversations every 30 minutes and hands them to a listener on
 `127.0.0.1`, which saves the raw JSON, commits it, and renders one file per
-chat. After the first backfill, each sync downloads only what changed. It also
-saves the list of your Cowork sessions and the folders attached to them.
+chat. After the first backfill, each sync downloads only what changed. Claude
+Docs that a chat creates or edits are kept too, at their current version. It
+also saves the list of your Cowork sessions and the folders attached to them.
 
 > [!WARNING]
 > claude-sync reads your chats through claude.ai's **undocumented internal web
@@ -25,8 +26,11 @@ saves the list of your Cowork sessions and the folders attached to them.
 data/
 ├── raw/<conversation-uuid>.json   # full conversations with every branch (source of truth)
 ├── index.json                     # names, timestamps, organizations, file names
+├── documents/<doc-uuid>.json      # Claude Docs the chats refer to
+├── documents.json                 # their titles, versions, file names
 ├── cowork/sessions.json           # your Cowork sessions and their folders
 ├── markdown/2026/2026-11-10--planning-the-trip--1a2b3c4d.md
+├── markdown/documents/2026/2026-11-10--trip-plan--5e6f7a8b9c0d.md
 └── .git/                          # one commit per sync that changed something
 ```
 
@@ -37,6 +41,14 @@ JSON. Claude's replies are rendered in full; its thinking is quoted, tool calls
 show the tool's name and input, and tool results and attachments are cut to
 2,000 characters in the rendered file (the raw JSON keeps them whole). Chats
 you delete in claude.ai are kept locally.
+
+**Docs.** When Claude creates, edits or reads a Claude Doc in a chat (the
+documents that open at `claude.ai/artifact/…`), the chat itself holds only the
+tool calls. claude-sync stores each such doc separately, renders it to its own
+file under `documents/`, and ends the chat's file with a *Documents* section
+linking to it. A doc can change after its chat ends, so every sync reads each
+doc again and stores the ones that changed. Docs you delete in claude.ai are
+kept locally.
 
 If your login belongs to several organizations (say a personal one and a Team
 one), chats from every organization with chats are synced, each recorded with
@@ -121,6 +133,15 @@ the file to resume.
   when you click *Sync now* in its popup, which also refetches the chat open
   in the current tab. No claude.ai tab needs to stay open. It waits out rate
   limits.
+- **Docs**: after the chats, the extension asks the listener which docs the
+  stored chats refer to, and which of their tabs the chats name. It reads
+  each doc as its own page in claude.ai exports it: the doc's page metadata
+  (`/api/frame/<uuid>`) grants a short-lived token for the Claude Docs
+  `export` tool (`/api/frame/mcp/call`), which returns one tab as Markdown with
+  its revision number. Titles come from `/api/frame/artifacts`. A doc whose
+  title or tab revisions changed is sent to the listener. A doc that answers
+  404 (deleted, or no longer shared with you) is checked for 30 days, then no
+  longer.
 - **Self-reload**: on each sync the extension sends the listener a hash of
   the code it has loaded; the listener compares it with the files in
   `extension/` and logs a mismatch. The extension then reloads itself, so
@@ -129,7 +150,8 @@ the file to resume.
 - **Listener** (`bin/claude-sync`): a dependency-free Python script bound to
   `127.0.0.1`. It only accepts writes from the extension's fixed origin
   (`chrome-extension://mfoglmpaedcenmkbdclbjljncebkflal`, pinned by the `key`
-  in the manifest), writes `raw/`, `index.json` and `cowork/sessions.json`,
+  in the manifest), writes `raw/`, `index.json`, `documents/`,
+  `documents.json` and `cowork/sessions.json`,
   commits them, and renders.
 
 **Errors** show as a red `!` badge on the toolbar icon. Click the icon for the
@@ -158,9 +180,25 @@ stable:
   conversation list gives it, or the conversation's own if that is later),
   `model`, `project_uuid`, `project` (its name),
   `is_starred`, `is_archived`, `source`, `file` (the rendered file, relative
-  to the output directory) and `fetched_at` (when the listener stored this
-  version). Timestamps from claude.ai are ISO 8601 in UTC; `fetched_at` is
-  ISO 8601 with the local offset.
+  to the output directory), `fetched_at` (when the listener stored this
+  version) and `documents` (the sorted UUIDs of the Claude Docs the
+  conversation refers to, on any branch). Timestamps from claude.ai are ISO
+  8601 in UTC; `fetched_at` is ISO 8601 with the local offset.
+- **`documents/<doc-uuid>.json`**: one Claude Doc as the extension fetched
+  it: `id`, `org`, `artifact` (the doc's entry in
+  `GET /api/frame/artifacts?ids=…&view=lean`: `title`, `created_at`,
+  `type_title` and so on) and `tabs`, a list of `id` (the tab's ID) and
+  `export` (the Claude Docs `export` tool's result for that tab, as Markdown:
+  `rev`, the tab's revision, and `data`, with `name` and the decoded file in
+  `text` instead of the `bytes_b64` claude.ai sends).
+- **`documents.json`**: an object keyed by doc UUID. Each entry has `kind`
+  (`"doc"`), `org` and `tabs` (the tab IDs the chats name, minus
+  `deleted_tabs`, those claude.ai no longer finds) and, once fetched,
+  `title`, `created_at` (from claude.ai), `fetched_at` (when the listener
+  stored this version: claude.ai reports no time of last change), `version`
+  (`title`, and `tabs` with each tab's revision) and `file` (the rendered
+  file, relative to the output directory). `missing_since` records when
+  claude.ai first answered 404; the local copy is kept.
 - **`cowork/sessions.json`**: the latest list of Cowork sessions:
   `fetched_at`, `orgs` (the organizations listed) and `sessions`, each with
   `id`, `org`, `title`, `created_at`, `updated_at`, `last_event_at`,
@@ -168,7 +206,7 @@ stable:
   It holds no session content. It is rewritten on every sync but committed
   only when the list changes.
 - **`~/.local/state/claude-sync/last-sync.json`**: the last completed sync:
-  `at`, `summary` (`listed`, `fetched`, `cowork_sessions`),
+  `at`, `summary` (`listed`, `fetched`, `documents`, `cowork_sessions`),
   `listing_changes`, `commit` (or `null` if nothing changed), `errors` (a
   list; empty when all went well) and `extension` (`version`,
   `install_type` as Chrome reports it, e.g. `development` for an unpacked
@@ -181,6 +219,14 @@ stable:
 - Images and uploaded files are not downloaded; attachments keep the text
   claude.ai extracted from them, and other files show their names.
 - Only the list of Cowork sessions is saved, not their content.
+- Of the documents a chat creates, only Claude Docs are synced. Other
+  artifacts (pages Claude publishes, and the artifacts of older chats, whose
+  content and edits are tool calls in the chat) show only as tool calls.
+- A doc's tabs are found in the chats' tool calls; a tab added in claude.ai
+  itself, outside any synced chat, is not fetched.
+- Each sync spends one request per doc and one per tab to check them, so
+  many docs slow syncing down. Whether claude.ai keeps deleted artifacts, and
+  for how long, is undocumented; the 30 days of checks are a guess.
 - Project chats are also enumerated project by project, through an endpoint
   that was untested at release for lack of an account with project chats.
   Whether the main list includes archived chats was also untested.

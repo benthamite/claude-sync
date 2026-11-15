@@ -102,6 +102,70 @@ def export_conversation(cid="99999999-2222-4333-8444-555555555555"):
     }
 
 
+DOC = "dddddddd-1111-4222-8333-444444444444"
+TAB1, TAB2, TAB3, NODE = "aaaa1111-0001", "bbbb2222-0002", "cccc3333-0003", "eeee5555-0005"
+
+
+def docs_call(tid, verb, args):
+    return {"type": "tool_use", "id": tid, "name": f"mcp__Claude_Docs__{verb}", "input": args,
+            "integration_name": "Claude Docs", "mcp_server_url": "https://api.anthropic.com/v1/pages/mcp"}
+
+
+def docs_result(tid, verb, payload, trailer=""):
+    return {"type": "tool_result", "tool_use_id": tid, "name": f"mcp__Claude_Docs__{verb}",
+            "is_error": False, "content": [text(json.dumps(payload) + trailer)]}
+
+
+def doc_conversation():
+    """A chat that creates a Claude Doc, edits it, adds a tab, exports and reads it."""
+    conv = conversation()
+    here = {"id": DOC, "kind": "project"}
+    conv["chat_messages"].append(msg("m5", "m4", "assistant", [
+        # The guide's examples name tabs that belong to no doc.
+        docs_call("g1", "guide", {"items": ["topic.instructions"]}),
+        docs_result("g1", "guide", {"example": True}, '\nits ack: "lids":{"f":"ffff6666-0006"}'),
+        docs_call("b1", "batch", {"container": {"kind": "project", "create": {"name": "Paper"}},
+                                  "batch": []}),
+        docs_result("b1", "batch", {"verdict": "allow", "lids": {"f": TAB1, "n": NODE},
+                                    "created": {"verdict": "allow", "minted": DOC, "bound": True},
+                                    "frame": {"slug": DOC}},
+                    "\n\nThe doc's viewer is at https://claude.ai/artifact/Short"),
+        docs_call("u1", "update", {"container": here, "engine": "prose",
+                                   "ref": {"object": "node", "id": NODE}, "payload": {"ops": []}}),
+        docs_result("u1", "update", {"verdict": "allow", "rev": 2}),
+        docs_call("b2", "batch", {"container": here, "batch": [
+            {"$lid": "f2", "object": "file", "verb": "create", "payload": {}},
+            {"$lid": "n2", "object": "node", "verb": "create", "payload": {}}]}),
+        docs_result("b2", "batch", {"verdict": "allow", "lids": {"f2": TAB2, "n2": "eeee5555-0007"}}),
+        docs_call("e1", "export", {"container": here, "file": TAB1, "format": "markdown"}),
+        docs_result("e1", "export", {"verdict": "allow", "rev": 2, "data": {"name": "Paper.md"}}),
+        docs_call("r1", "read", {"container": here, "ref": {"object": "project", "id": DOC}}),
+        docs_result("r1", "read", {"verdict": "allow", "value": {"tabs": {TAB1: {}, TAB3: {}}}}),
+        text("The doc is ready."),
+    ], "2026-10-03T14:02:00Z"))
+    conv["current_leaf_message_uuid"] = "m5"
+    return conv
+
+
+def b64(s):
+    import base64
+    return base64.b64encode(s.encode()).decode()
+
+
+def doc_record(rev=3, title="Paper", body="# Paper\n\n## Intro\n\nVersion two.\n", tabs=2):
+    """A doc as the extension sends it: its metadata and each tab's export result."""
+    exports = [(TAB1, rev, "Paper.md", body), (TAB2, 1, "Referees.md", "# Referees\n\nThanks.\n")]
+    return {
+        "id": DOC, "org": ORG,
+        "artifact": {"kind": "page", "id": DOC, "title": title, "type_title": "Docs",
+                     "created_at": "2026-10-03T14:01:30Z", "updated_at": "2026-10-03T14:01:30Z"},
+        "tabs": [{"id": tab, "export": {"verdict": "allow", "rev": r,
+                                        "data": {"name": name, "format": "markdown", "bytes_b64": b64(md)}}}
+                 for tab, r, name, md in exports[:tabs]],
+        "deleted_tabs": [TAB3],
+    }
+
+
 def entry_for(conv):
     return {"name": conv["name"], "created_at": conv["created_at"], "updated_at": conv["updated_at"],
             "model": conv.get("model"), "org": ORG, "org_name": "Test org"}
@@ -115,7 +179,7 @@ class RenderMarkdownTests(unittest.TestCase):
 
     def render(self, conv=None):
         conv = conv or conversation()
-        return self.cs.render_markdown(conv, entry_for(conv))
+        return self.cs.render_markdown(conv, entry_for(conv), {})
 
     def test_default_format_is_markdown_under_data(self):
         self.assertEqual(self.cs.FORMAT, "markdown")
@@ -181,7 +245,7 @@ class RenderOrgTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp)
         cs = load({"format": "org", "data_dir": os.path.join(tmp, "data")}, tmp)
         conv = conversation()
-        org = cs.render_org(conv, dict(entry_for(conv), org_mode_id="ABC-123"))
+        org = cs.render_org(conv, dict(entry_for(conv), org_mode_id="ABC-123"), {})
         self.assertTrue(org.startswith(":PROPERTIES:\n:ID:       ABC-123\n"))
         self.assertIn(f":CLAUDE_URL: https://claude.ai/chat/{CID}", org)
         self.assertIn("#+title: Test chat", org)
@@ -201,7 +265,7 @@ class StoreTests(unittest.TestCase):
     def stored(self, conv, meta=None, index=None, **kw):
         conv["_claude_sync"] = {"org": ORG, "source": "api"}
         index = {} if index is None else index
-        return self.cs.store(conv, dict(meta or {}, org=ORG), index, **kw), index
+        return self.cs.store(conv, dict(meta or {}, org=ORG), index, {}, **kw), index
 
     def test_index_entry_has_the_documented_fields(self):
         _, index = self.stored(conversation(), {"project_uuid": "p1", "project": "Proj",
@@ -236,11 +300,11 @@ class StoreTests(unittest.TestCase):
         conv = conversation()
         conv["is_starred"] = True                        # as fetched
         _, index = self.stored(conv)
-        changed = self.cs.update_listing([{"uuid": CID, "is_starred": False, "name": "New name"}], index)
+        changed = self.cs.update_listing([{"uuid": CID, "is_starred": False, "name": "New name"}], index, {})
         self.assertEqual(changed, [CID])
         self.assertIn("new-name", index[CID]["file"])
         with open(os.path.join(self.cs.RAW, f"{CID}.json")) as f:
-            self.cs.store(json.load(f), None, index, force=True)   # what `render` does
+            self.cs.store(json.load(f), None, index, {}, force=True)   # what `render` does
         self.assertFalse(index[CID]["is_starred"])
         self.assertEqual(index[CID]["name"], "New name")
         self.assertEqual(index[CID]["org"], ORG)
@@ -250,7 +314,7 @@ class StoreTests(unittest.TestCase):
         exported["updated_at"] = conversation()["updated_at"]
         exported["_claude_sync"] = {"org": None, "source": "export"}
         index = {}
-        self.cs.store(exported, None, index)
+        self.cs.store(exported, None, index, {})
         self.assertEqual(index[CID]["source"], "export")
         written, index = self.stored(conversation(), index=index)   # same updated_at
         self.assertTrue(written)
@@ -260,6 +324,136 @@ class StoreTests(unittest.TestCase):
         # No trailing slash, so a symlinked output folder is ignored too.
         with open(os.path.join(self.cs.DATA, ".gitignore")) as f:
             self.assertEqual(f.read(), "/markdown\n/org\n")
+
+
+class DocumentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.cs = load({"data_dir": os.path.join(self.tmp, "data")}, self.tmp)
+        self.cs.ensure_data_repo()
+
+    def store_chat(self):
+        conv = doc_conversation()
+        conv["_claude_sync"] = {"org": ORG, "source": "api"}
+        index, docs = {}, {}
+        self.cs.note_document_refs(conv, ORG, docs)
+        self.cs.store(conv, {"org": ORG}, index, docs)
+        return index, docs
+
+    def read_output(self, rel):
+        with open(os.path.join(self.cs.OUTPUT, rel)) as f:
+            return f.read()
+
+    def test_refs_name_the_doc_and_its_tabs(self):
+        self.assertEqual(self.cs.document_refs(doc_conversation()), {DOC: [TAB1, TAB2, TAB3]})
+        self.assertEqual(self.cs.document_refs(conversation()), {})
+
+    def test_chat_links_its_doc_before_and_after_the_doc_is_fetched(self):
+        index, docs = self.store_chat()
+        entry = index[CID]
+        self.assertEqual(entry["documents"], [DOC])
+        self.assertEqual(docs[DOC], {"kind": "doc", "org": ORG, "tabs": [TAB1, TAB2, TAB3]})
+        self.assertIn(f"## Documents\n\n- [{DOC}](https://claude.ai/code/artifact/{DOC})\n",
+                      self.read_output(entry["file"]))
+        self.assertTrue(self.cs.store_document(doc_record(), docs, index))
+        doc = docs[DOC]
+        self.assertEqual(doc["file"], f"documents/2026/2026-10-03--paper--{DOC[-12:]}.md")
+        link = os.path.relpath(doc["file"], os.path.dirname(entry["file"]))
+        self.assertIn(f"- [Paper]({link})", self.read_output(entry["file"]))   # relinked
+
+    def test_stored_doc_has_the_documented_fields(self):
+        index, docs = self.store_chat()
+        self.cs.store_document(doc_record(), docs, index)
+        doc = docs[DOC]
+        self.assertEqual((doc["kind"], doc["title"], doc["org"]), ("doc", "Paper", ORG))
+        self.assertEqual(doc["tabs"], [TAB1, TAB2])            # TAB3 no longer exists
+        self.assertEqual(doc["deleted_tabs"], [TAB3])
+        self.assertEqual(doc["version"], {"title": "Paper", "tabs": {TAB1: 3, TAB2: 1}})
+        self.assertEqual(doc["created_at"], "2026-10-03T14:01:30Z")
+        self.assertIn("fetched_at", doc)
+        with open(os.path.join(self.cs.DOCS_RAW, f"{DOC}.json")) as f:
+            raw = json.load(f)
+        self.assertEqual(raw["tabs"][0]["export"]["data"]["text"], "# Paper\n\n## Intro\n\nVersion two.\n")
+        self.assertNotIn("bytes_b64", raw["tabs"][0]["export"]["data"])
+        self.assertNotIn("deleted_tabs", raw)
+        # The chats no longer offer the deleted tab for fetching.
+        self.cs.note_document_refs(doc_conversation(), ORG, docs)
+        self.assertEqual(docs[DOC]["tabs"], [TAB1, TAB2])
+
+    def test_doc_file_holds_each_tab(self):
+        index, docs = self.store_chat()
+        self.cs.store_document(doc_record(), docs, index)
+        md = self.read_output(docs[DOC]["file"])
+        self.assertTrue(md.startswith('---\ntitle: "Paper"\n'))
+        self.assertIn(f'claude_artifact_id: "{DOC}"', md)
+        self.assertIn("\n# Paper\n\n## Paper\n\n### Paper\n\n#### Intro\n\nVersion two.\n", md)
+        self.assertIn("\n## Referees\n\n### Referees\n\nThanks.\n", md)
+        single = dict(doc_record(tabs=1), id=DOC)
+        self.cs.store_document(single, docs, index, force=True)
+        self.assertIn("\n# Paper\n\n## Paper\n\n### Intro\n", self.read_output(docs[DOC]["file"]))
+
+    def test_only_a_changed_doc_is_rewritten(self):
+        index, docs = self.store_chat()
+        self.assertTrue(self.cs.store_document(doc_record(), docs, index))
+        self.assertFalse(self.cs.store_document(doc_record(), docs, index))
+        self.assertTrue(self.cs.store_document(doc_record(rev=4, body="Version three.\n"), docs, index))
+        first = docs[DOC]["file"]
+        self.assertIn("Version three.", self.read_output(first))
+        self.assertTrue(self.cs.store_document(doc_record(rev=4, title="Renamed", body="x\n"), docs, index))
+        self.assertFalse(os.path.exists(os.path.join(self.cs.OUTPUT, first)))
+        self.assertIn("[Renamed](", self.read_output(index[CID]["file"]))
+
+    def test_documents_to_check(self):
+        index, docs = self.store_chat()
+        now = self.cs.to_epoch("2026-11-15T12:00:00Z")
+        self.assertEqual(self.cs.documents_to_check(index, docs, now),
+                         {DOC: {"org": ORG, "tabs": [TAB1, TAB2, TAB3], "version": None}})
+        self.cs.store_document(doc_record(), docs, index)
+        self.assertEqual(self.cs.documents_to_check(index, docs, now)[DOC]["version"],
+                         docs[DOC]["version"])
+        self.cs.mark_missing(DOC, docs)                     # claude.ai answered 404
+        self.assertIsNone(self.cs.documents_to_check(index, docs, now)[DOC]["version"])
+        self.assertTrue(os.path.exists(os.path.join(self.cs.OUTPUT, docs[DOC]["file"])))
+        docs[DOC]["missing_since"] = "2026-10-01T12:00:00+00:00"   # long gone
+        self.assertEqual(self.cs.documents_to_check(index, docs, now), {})
+        self.assertTrue(self.cs.store_document(doc_record(), docs, index))   # it came back
+        self.assertNotIn("missing_since", docs[DOC])
+
+    def test_listener_backfills_chats_stored_before_docs_were_synced(self):
+        index, _ = self.store_chat()
+        del index[CID]["documents"]
+        self.cs.save_index(index)
+        self.cs.backfill_document_refs()
+        self.assertEqual(self.cs.load_index()[CID]["documents"], [DOC])
+        self.assertEqual(self.cs.load_documents()[DOC]["tabs"], [TAB1, TAB2, TAB3])
+
+
+@unittest.skipUnless(shutil.which("pandoc"), "pandoc not installed")
+class DocumentOrgTests(unittest.TestCase):
+    def test_org_doc_and_link(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        cs = load({"format": "org", "data_dir": os.path.join(tmp, "data")}, tmp)
+        cs.ensure_data_repo()
+        conv = doc_conversation()
+        conv["_claude_sync"] = {"org": ORG, "source": "api"}
+        index, docs = {}, {}
+        cs.note_document_refs(conv, ORG, docs)
+        cs.store(conv, {"org": ORG}, index, docs)
+        cs.store_document(doc_record(tabs=1), docs, index)
+        with open(os.path.join(cs.OUTPUT, docs[DOC]["file"])) as f:
+            org = f.read()
+        self.assertTrue(org.startswith(f":PROPERTIES:\n:CLAUDE_ARTIFACT_ID: {DOC}\n"))
+        self.assertIn(":FETCHED: [", org)
+        self.assertIn("#+title: Paper\n\n* Paper\n** Intro\nVersion two.", org)
+        with open(os.path.join(cs.OUTPUT, index[CID]["file"])) as f:
+            chat = f.read()
+        link = os.path.relpath(docs[DOC]["file"], os.path.dirname(index[CID]["file"]))
+        self.assertIn(f"* Documents\n\n- [[file:{link}][Paper]]", chat)
+        cs.store_document(doc_record(), docs, index, force=True)   # two tabs
+        with open(os.path.join(cs.OUTPUT, docs[DOC]["file"])) as f:
+            self.assertIn("* Paper\n\n** Paper\n*** Intro", f.read())
 
 
 class ImportTests(unittest.TestCase):
@@ -285,7 +479,7 @@ class ImportTests(unittest.TestCase):
         index = {}
         app_copy = conversation(name="App copy")
         app_copy["_claude_sync"] = {"org": ORG, "source": "api"}
-        self.cs.store(app_copy, {"org": ORG}, index)
+        self.cs.store(app_copy, {"org": ORG}, index, {})
         self.cs.save_index(index)
 
         out = self.run_import(zpath, org=ORG)
@@ -366,17 +560,38 @@ class ListenerTests(unittest.TestCase):
         tracked = subprocess.run(["git", "-C", self.cs.DATA, "ls-files"],
                                  capture_output=True, text=True, check=True).stdout.split()
         self.assertEqual(sorted(tracked), ["cowork/sessions.json", "index.json", f"raw/{CID}.json"])
-        self.assertEqual(self.git_log(), ["sync: 1 fetched, 0 list changes, 1 Cowork sessions"])
+        self.assertEqual(self.git_log(), ["sync: 1 fetched, 0 list changes, 0 documents, 1 Cowork sessions"])
         # An unchanged Cowork list and no new chats make no commit.
         status, done = self.request("POST", "/sync-done", {"listing": [], "summary": {}, "cowork": cowork})
         self.assertIsNone(done["commit"])
         self.assertEqual(len(self.git_log()), 1)
 
+    def test_documents_round_trip_commits(self):
+        item = {"org": ORG, "meta": {"uuid": CID}, "conversation": doc_conversation()}
+        self.assertEqual(self.request("POST", "/conversations", {"items": [item]})[0], 200)
+        status, checks = self.request("GET", "/documents")
+        self.assertEqual(checks, {"documents": {DOC: {"org": ORG, "tabs": [TAB1, TAB2, TAB3],
+                                                      "version": None}}})
+        self.assertEqual(self.request("POST", "/documents", {"documents": [doc_record()], "missing": []}),
+                         (200, {"written": 1}))
+        status, done = self.request("POST", "/sync-done", {"listing": [],
+                                                           "summary": {"fetched": 1, "documents": 1}})
+        self.assertTrue(done["commit"])
+        tracked = subprocess.run(["git", "-C", self.cs.DATA, "ls-files"],
+                                 capture_output=True, text=True, check=True).stdout.split()
+        self.assertIn(f"documents/{DOC}.json", tracked)
+        self.assertIn("documents.json", tracked)
+        self.assertEqual(self.git_log(), ["sync: 1 fetched, 0 list changes, 1 documents"])
+        version = self.request("GET", "/documents")[1]["documents"][DOC]["version"]
+        self.assertEqual(version, {"title": "Paper", "tabs": {TAB1: 3, TAB2: 1}})
+        self.assertEqual(self.request("POST", "/documents", {"documents": [], "missing": [DOC]})[0], 200)
+        self.assertIsNone(self.request("GET", "/documents")[1]["documents"][DOC]["version"])
+
     def test_state_asks_for_imported_chats_again(self):
         exported = export_conversation()
         exported["_claude_sync"] = {"org": None, "source": "export"}
         index = {}
-        self.cs.store(exported, None, index)
+        self.cs.store(exported, None, index, {})
         self.cs.save_index(index)
         self.assertEqual(self.request("GET", "/state")[1]["ids"], {exported["uuid"]: 0})
 

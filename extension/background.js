@@ -107,10 +107,13 @@ async function server(method, path, body) {
   return json;
 }
 
-async function api(path, headers = {}) {
+// A GET, or a POST of `body` as JSON.
+async function api(path, headers = {}, body = undefined) {
   for (let attempt = 0; ; attempt++) {
     const r = await fetch(CLAUDE + path, {
-      headers,
+      method: body === undefined ? 'GET' : 'POST',
+      headers: body === undefined ? headers : {...headers, 'Content-Type': 'application/json'},
+      body: body === undefined ? undefined : JSON.stringify(body),
       credentials: 'include',
       signal: AbortSignal.timeout(120000),
     });
@@ -241,9 +244,117 @@ async function listCowork(orgs) {
   return {orgs: orgs.map((o) => o.uuid), sessions};
 }
 
+// claude.ai's artifact endpoints (/api/frame/...) answer 404 without this
+// header, which claude.ai's own pages send.
+const FRAME_HEADERS = {'X-Frame-CP': 'go'};
+const LOOKUP_BATCH = 50;  // doc IDs per metadata lookup
+
+// The JSON an export call returns, from the tool result's text blocks (one
+// may be a notice that others wrote the content; the JSON may be followed by
+// a support line).
+function exportOf(result) {
+  for (const item of (result && result.content) || []) {
+    const t = item && typeof item.text === 'string' ? item.text : '';
+    const start = t.indexOf('{');
+    const end = t.lastIndexOf('}');
+    if (start < 0 || end < start) continue;
+    try {
+      const j = JSON.parse(t.slice(start, end + 1));
+      if (j && j.verdict) return j;
+    } catch (e) { /* not this block */ }
+  }
+  throw new Error('export returned no result');
+}
+
+function sameVersion(a, b) {
+  if (!a || !b || a.title !== b.title) return false;
+  const ka = Object.keys(a.tabs || {}).sort();
+  const kb = Object.keys(b.tabs || {}).sort();
+  return ka.length === kb.length && ka.every((k, i) => k === kb[i] && a.tabs[k] === b.tabs[k]);
+}
+
+// Claude Docs live outside the chats that create or edit them and can change
+// after a chat ends, so every doc a stored chat refers to is read on every
+// run. The listener names the docs (including any that the chats just stored
+// refer to), their organization, the tabs the chats name and the version it
+// has. A doc is read the way its own page in claude.ai exports it: its page's
+// metadata grants a short-lived token for the Claude Docs export tool, which
+// returns one tab, as Markdown with its revision number. A doc whose title or
+// revisions differ from the stored version is sent to the listener.
+async function syncDocuments(summary, errors) {
+  await stage('checking documents');
+  const {documents} = await server('GET', '/documents');
+  const ids = Object.keys(documents);
+  const byOrg = new Map();
+  for (const id of ids) byOrg.set(documents[id].org, [...(byOrg.get(documents[id].org) || []), id]);
+  let batch = [];
+  const missing = [];
+  let n = 0;
+  for (const [org, orgIds] of byOrg) {
+    const q = `org=${encodeURIComponent(org)}`;
+    // Titles and creation times, in a few requests.
+    const meta = new Map();
+    try {
+      for (let i = 0; i < orgIds.length; i += LOOKUP_BATCH) {
+        await sleep(LIST_GAP_MS);
+        const j = await api(`/api/frame/artifacts?ids=${orgIds.slice(i, i + LOOKUP_BATCH).join(',')}` +
+                            `&rel=all&view=lean&${q}`, FRAME_HEADERS);
+        for (const a of j.artifacts || []) meta.set(a.id, a);
+      }
+    } catch (e) {
+      errors.push(`documents of ${org}: ${e.message}`);
+      continue;
+    }
+    for (const id of orgIds) {
+      await stage(`checking documents ${++n}/${ids.length}`);
+      await sleep(FETCH_GAP_MS);
+      try {
+        let page;
+        try {
+          page = await api(`/api/frame/${id}?${q}`, FRAME_HEADERS);
+        } catch (e) {
+          // A deleted doc, or one no longer shared with this account, answers
+          // 404. The listener keeps the local copy.
+          if (e.status === 404) { missing.push(id); continue; }
+          throw e;
+        }
+        const token = page.capabilities && page.capabilities.mcp && page.capabilities.mcp.token;
+        if (!token) throw new Error('claude.ai granted no export token for this doc');
+        const artifact = meta.get(id) ||
+          {id, title: page.title, created_at: page.created_at, updated_at: page.updated_at};
+        const tabs = [];
+        const deletedTabs = [];
+        for (const tab of documents[id].tabs) {
+          await sleep(FETCH_GAP_MS);
+          const res = await api(`/api/frame/mcp/call?${q}`, FRAME_HEADERS, {
+            slug: id, server: 'Claude Docs', tool: 'export', mcpToken: token,
+            input: {container: {id, kind: 'project'}, file: tab, format: 'markdown'},
+          });
+          const exp = exportOf(res.result);
+          if (exp.verdict === 'allow') tabs.push({id: tab, export: exp});
+          else if (exp.reason === 'unknown_id') deletedTabs.push(tab);  // the tab was deleted
+          else throw new Error(`tab ${tab}: ${exp.reason}: ${exp.detail || ''}`);
+        }
+        const version = {title: artifact.title || 'Untitled',
+                         tabs: Object.fromEntries(tabs.map((t) => [t.id, t.export.rev]))};
+        if (sameVersion(version, documents[id].version) && !deletedTabs.length) continue;
+        batch.push({id, org, artifact, tabs, deleted_tabs: deletedTabs});
+        summary.documents++;
+      } catch (e) {
+        errors.push(`document ${id}: ${e.message}`);
+      }
+      if (batch.length >= BATCH) {
+        await server('POST', '/documents', {documents: batch, missing: []});
+        batch = [];
+      }
+    }
+  }
+  if (batch.length || missing.length) await server('POST', '/documents', {documents: batch, missing});
+}
+
 async function runSync(force = []) {
   const errors = [];
-  const summary = {listed: 0, fetched: 0, cowork_sessions: null};
+  const summary = {listed: 0, fetched: 0, documents: 0, cowork_sessions: null};
   let error = null;
   let errorKind = null;
   try {
@@ -307,6 +418,7 @@ async function runSync(force = []) {
         batch = [];
       }
     }
+    await syncDocuments(summary, errors);
     await stage('listing Cowork sessions');
     let cowork = null;
     try {

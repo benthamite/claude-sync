@@ -10,6 +10,8 @@ Subcommands:
 Raw conversation JSON in the data directory is the source of truth and is
 committed to a local git repo there after each sync. Markdown (default) or Org
 files are generated from it and can be rebuilt at any time with `render`.
+Claude Docs that a conversation creates, edits or reads are stored and
+rendered the same way, and each conversation's file links to them.
 
 Settings come from ~/.config/claude-sync/config.json (or the file named by
 CLAUDE_SYNC_CONFIG). All keys are optional:
@@ -23,6 +25,7 @@ CLAUDE_SYNC_CONFIG). All keys are optional:
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import json
@@ -73,6 +76,8 @@ STATE_DIR = os.path.expanduser(CONFIG.get("state_dir") or "~/.local/state/claude
 RAW = os.path.join(DATA, "raw")
 INDEX = os.path.join(DATA, "index.json")
 COWORK = os.path.join(DATA, "cowork", "sessions.json")
+DOCS_RAW = os.path.join(DATA, "documents")
+DOCS_INDEX = os.path.join(DATA, "documents.json")
 LAST_SYNC = os.path.join(STATE_DIR, "last-sync.json")
 PAUSED = os.path.join(STATE_DIR, "paused")
 
@@ -173,6 +178,16 @@ def load_index() -> dict:
 
 def save_index(index: dict) -> None:
     write_atomic(INDEX, dump(index))
+
+
+def load_documents() -> dict:
+    return load_json(DOCS_INDEX, {})
+
+
+def save_documents(docs: dict) -> None:
+    # Unchanged (or still empty and never written): leave the file alone.
+    if load_json(DOCS_INDEX, {}) != docs:
+        write_atomic(DOCS_INDEX, dump(docs))
 
 
 def slugify(title: str) -> str:
@@ -377,7 +392,11 @@ def title_of(entry: dict) -> str:
     return entry.get("name") or "Untitled"
 
 
-def render_markdown(conv: dict, entry: dict) -> str:
+def markdown_link_text(text: str) -> str:
+    return re.sub(r"([][])", r"\\\1", text)
+
+
+def render_markdown(conv: dict, entry: dict, docs: dict) -> str:
     cid = conv_id(conv)
     front = {
         "title": title_of(entry),
@@ -406,6 +425,10 @@ def render_markdown(conv: dict, entry: dict) -> str:
             out += [markdown_literal(literal), ""]
         if md:
             out += [shift_headings(md, 2), ""]
+    links = document_links(entry, docs)
+    if links:
+        out += ["## Documents", ""]
+        out += [f"- [{markdown_link_text(label)}]({target})" for target, label in links]
     return "\n".join(out).rstrip("\n") + "\n"
 
 
@@ -415,10 +438,10 @@ PANDOC_FROM = "markdown-smart-auto_identifiers+tex_math_single_backslash"
 SEPARATOR = "CLAUDESYNCSEPARATOR7F3A"
 
 
-def pandoc(markdown: str) -> str:
+def pandoc(markdown: str, shift: int = 1) -> str:
     out = subprocess.run(
         ["pandoc", "-f", PANDOC_FROM, "-t", "org", "--wrap=preserve",
-         "--shift-heading-level-by=1"],
+         f"--shift-heading-level-by={shift}"],
         input=markdown, capture_output=True, text=True, check=True)
     return out.stdout
 
@@ -445,7 +468,12 @@ def org_literal(text: str) -> str:
     return f"#+begin_example\n{escaped}\n#+end_example"
 
 
-def render_org(conv: dict, entry: dict) -> str:
+def org_link(target: str, label: str) -> str:
+    label = label.replace("[", "(").replace("]", ")")
+    return f"[[{target if '://' in target else 'file:' + target}][{label}]]"
+
+
+def render_org(conv: dict, entry: dict, docs: dict) -> str:
     blocks = visible_blocks(conv)
     converted = iter(md_to_org_many([b[4] for b in blocks if b[4]]))
     bodies = []
@@ -483,14 +511,18 @@ def render_org(conv: dict, entry: dict) -> str:
             out += [f"* {head}{stamp}", ""]
             prev_key = key
         out += [body, ""]
+    links = document_links(entry, docs)
+    if links:
+        out += ["* Documents", ""]
+        out += [f"- {org_link(target, label)}" for target, label in links]
     return "\n".join(out).rstrip("\n") + "\n"
 
 
 RENDERERS = {"markdown": render_markdown, "org": render_org}
 
 
-def render(conv: dict, entry: dict) -> str:
-    return RENDERERS[FORMAT](conv, entry)
+def render(conv: dict, entry: dict, docs: dict) -> str:
+    return RENDERERS[FORMAT](conv, entry, docs)
 
 
 def output_relpath(entry: dict, cid: str) -> str:
@@ -498,6 +530,323 @@ def output_relpath(entry: dict, cid: str) -> str:
     return os.path.join(created.strftime("%Y"),
                         f"{created:%Y-%m-%d}--{slugify(title_of(entry))}--{cid[:8]}"
                         + FORMATS[FORMAT])
+
+
+# -------------------------------------------------------------- documents
+#
+# A Claude Doc (an artifact of claude.ai's Docs type) lives outside the
+# conversation that creates or edits it: the conversation holds only the
+# Claude Docs tool calls, and the doc can change after the chat ends, in
+# claude.ai itself or from another chat. So every doc a stored chat refers to
+# is stored on its own (documents/, documents.json), rendered to its own
+# file, linked from the chat's file, and checked for changes on every sync.
+#
+# The extension reads a doc the way its page in claude.ai exports it: one tab
+# at a time, by the tab's ID, as Markdown. Nothing it can call lists a doc's
+# tabs, so the tabs fetched are those the stored chats name.
+
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+TAB_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}")
+DOCS_TOOL = re.compile(r"Claude[_ ]Docs(?:__|:)(\w+)$")
+DOCS_SERVER = "https://api.anthropic.com/v1/pages/mcp"
+# How long a doc that claude.ai no longer finds is still checked, in case it
+# is restored. claude.ai does not say whether or for how long it keeps a
+# deleted artifact; this is chatgpt-sync's wait for ChatGPT's trash.
+MISSING_DAYS = 30
+
+
+def artifact_url(doc: str) -> str:
+    return f"https://claude.ai/code/artifact/{doc}"
+
+
+def docs_verb(block: dict) -> str | None:
+    """The Claude Docs tool a tool_use block calls (batch, update, ...), or None."""
+    name = block.get("name") or ""
+    m = DOCS_TOOL.search(name)
+    if m:
+        return m.group(1)
+    if block.get("integration_name") == "Claude Docs" or block.get("mcp_server_url") == DOCS_SERVER:
+        return re.split(r"__|:", name)[-1] or None
+    return None
+
+
+def first_json(text: str):
+    """The JSON object a tool result starts with (Claude Docs appends prose to some)."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        return json.JSONDecoder().raw_decode(text[start:])[0]
+    except ValueError:
+        return None
+
+
+def document_refs(conv: dict) -> dict:
+    """The Claude Docs a conversation refers to, on any branch: {doc ID: [tab IDs]}.
+
+    Every Claude Docs tool call names its doc as its container, and the batch
+    call that creates a doc names it in its result. Tabs (which the Docs
+    service calls files) are named by the results of the batch calls that
+    create them, by export calls, and by reads of a whole doc, which list its
+    tabs.
+    """
+    refs: dict = {}
+
+    def add(doc, tab=None):
+        if isinstance(doc, str) and UUID.fullmatch(doc):
+            tabs = refs.setdefault(doc, [])
+            if isinstance(tab, str) and TAB_ID.fullmatch(tab) and tab not in tabs:
+                tabs.append(tab)
+
+    calls = {}
+    msgs = sorted((m for m in conv.get("chat_messages") or [] if isinstance(m, dict)), key=message_order)
+    for msg in msgs:
+        for block in msg.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                verb = docs_verb(block)
+                if verb is None:
+                    continue
+                args = block.get("input") if isinstance(block.get("input"), dict) else {}
+                container = args.get("container") if isinstance(args.get("container"), dict) else {}
+                calls[block.get("id")] = (verb, args, container)
+                add(container.get("id"))
+                if verb == "export":
+                    add(container.get("id"), args.get("file"))
+            elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
+                verb, args, container = calls[block["tool_use_id"]]
+                result = first_json(result_text(block.get("content")))
+                if not isinstance(result, dict) or result.get("verdict") != "allow":
+                    continue
+                doc = container.get("id")
+                if verb == "batch":
+                    # "lids" maps the call's local names to the IDs minted for
+                    # them. A new doc's first tab is "f"; a tab added later is
+                    # whatever name its batch member gave it.
+                    doc = doc or (result.get("created") or {}).get("minted")
+                    names = ["f"] if "create" in container else []
+                    names += [m.get("$lid") for m in args.get("batch") or []
+                              if isinstance(m, dict) and m.get("object") == "file"
+                              and m.get("verb") == "create"]
+                    add(doc)
+                    for name in names:
+                        add(doc, (result.get("lids") or {}).get(name))
+                elif verb == "read" and (args.get("ref") or {}).get("object") == "project":
+                    for tab in (result.get("value") or {}).get("tabs") or {}:
+                        add(doc, tab)
+    return refs
+
+
+def note_document_refs(conv: dict, org: str | None, docs: dict) -> None:
+    """Record in the documents index the docs a conversation refers to and the
+    tabs it names, so that the extension can fetch them."""
+    for doc, tabs in document_refs(conv).items():
+        entry = docs.setdefault(doc, {"kind": "doc"})
+        if org and not entry.get("org"):
+            entry["org"] = org
+        known = entry.setdefault("tabs", [])
+        known += [t for t in tabs if t not in known and t not in (entry.get("deleted_tabs") or [])]
+
+
+def decode_export(export: dict) -> dict:
+    """An export result with its base64 file replaced by the text it encodes."""
+    data = dict(export.get("data") or {})
+    if "bytes_b64" in data:
+        data["text"] = base64.b64decode(data.pop("bytes_b64")).decode("utf-8")
+    return dict(export, data=data)
+
+
+def document_title(record: dict) -> str:
+    return (record.get("artifact") or {}).get("title") or "Untitled"
+
+
+def document_version(record: dict) -> dict:
+    """What changes when the doc does: its title and each tab's revision.
+
+    The extension computes the same from what it fetches, to send only docs
+    that changed. claude.ai's artifact metadata (updated_at included) does
+    not change when a doc's text does.
+    """
+    return {"title": document_title(record),
+            "tabs": {t["id"]: (t.get("export") or {}).get("rev") for t in record.get("tabs") or []}}
+
+
+def document_tabs(record: dict) -> list:
+    """(name, Markdown) for each tab of a stored doc."""
+    out = []
+    for tab in record.get("tabs") or []:
+        data = (tab.get("export") or {}).get("data") or {}
+        out.append((re.sub(r"\.md$", "", data.get("name") or "") or tab["id"], data.get("text") or ""))
+    return out
+
+
+NO_TABS = "(No tab of this doc that claude-sync knows of still exists.)"
+
+
+def render_document_markdown(record: dict, entry: dict) -> str:
+    doc = record["id"]
+    front = {"title": entry["title"], "claude_artifact_id": doc, "url": artifact_url(doc),
+             "created": iso_ts(to_epoch(entry.get("created_at"))),
+             "fetched": iso_ts(to_epoch(entry.get("fetched_at")))}
+    out = ["---"]
+    out += [f"{k}: {json.dumps(v, ensure_ascii=False)}" for k, v in front.items()]
+    out += ["---", "", f"# {entry['title']}", ""]
+    tabs = document_tabs(record)
+    if len(tabs) == 1:
+        out.append(shift_headings(tabs[0][1], 1))
+    for name, md in tabs if len(tabs) > 1 else []:
+        out += [f"## {name}", "", shift_headings(md, 2), ""]
+    if not tabs:
+        out.append(NO_TABS)
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def render_document_org(record: dict, entry: dict) -> str:
+    doc = record["id"]
+    out = [":PROPERTIES:"]
+    if entry.get("org_mode_id"):
+        out.append(f":ID:       {entry['org_mode_id']}")
+    out += [f":CLAUDE_ARTIFACT_ID: {doc}",
+            f":CLAUDE_URL: {artifact_url(doc)}",
+            f":CREATED: {org_ts(to_epoch(entry.get('created_at')))}",
+            f":FETCHED: {org_ts(to_epoch(entry.get('fetched_at')))}",
+            ":END:", f"#+title: {entry['title']}", ""]
+    tabs = document_tabs(record)
+    if len(tabs) == 1:
+        out.append(pandoc(tabs[0][1], shift=0))
+    elif tabs:
+        for (name, _), body in zip(tabs, md_to_org_many([md for _, md in tabs])):
+            out += [f"* {name}", "", body, ""]
+    else:
+        out.append(NO_TABS)
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+DOCUMENT_RENDERERS = {"markdown": render_document_markdown, "org": render_document_org}
+
+
+def document_relpath(doc: str, title: str, created_at) -> str:
+    when = dt.datetime.fromtimestamp(to_epoch(created_at))
+    return os.path.join("documents", when.strftime("%Y"),
+                        f"{when:%Y-%m-%d}--{slugify(title)}--{doc[-12:]}" + FORMATS[FORMAT])
+
+
+def document_links(entry: dict, docs: dict) -> list:
+    """(target, label) for each doc a conversation refers to.
+
+    A stored doc is linked by its file's path relative to the conversation's
+    file; one not stored (yet) by its claude.ai URL.
+    """
+    links = []
+    for doc in entry.get("documents") or []:
+        stored = docs.get(doc) or {}
+        if stored.get("file"):
+            target = os.path.relpath(stored["file"], os.path.dirname(entry["file"]))
+            links.append((target.replace(os.sep, "/"), stored.get("title") or doc))
+        else:
+            links.append((artifact_url(doc), doc))
+    return links
+
+
+def rerender_conversations(doc: str, index: dict, docs: dict) -> None:
+    """Rewrite the files of the conversations that link to a doc."""
+    for cid, entry in index.items():
+        if doc in (entry.get("documents") or []):
+            with open(raw_path(cid), encoding="utf-8") as f:
+                conv = json.load(f)
+            write_atomic(os.path.join(OUTPUT, entry["file"]), render(conv, entry, docs))
+
+
+def store_document(record: dict, docs: dict, index: dict, force: bool = False) -> bool:
+    """Save one doc's JSON and rendered file. Return True if written.
+
+    `record` is what the extension fetched: the doc's ID and organization,
+    its artifact metadata, its tabs' export results and the known tabs that
+    no longer exist (deleted_tabs).
+    """
+    doc = record["id"]
+    if not UUID.fullmatch(doc):
+        raise ValueError(f"not a doc ID: {doc!r}")
+    old = docs.get(doc) or {}
+    gone = list(old.get("deleted_tabs") or [])
+    gone += [t for t in record.pop("deleted_tabs", None) or [] if t not in gone]
+    record["tabs"] = [dict(t, export=decode_export(t.get("export") or {})) for t in record.get("tabs") or []]
+    version = document_version(record)
+    if old.get("version") == version and not old.get("missing_since") and not force \
+            and gone == list(old.get("deleted_tabs") or []):
+        return False
+    title = document_title(record)
+    created = (record.get("artifact") or {}).get("created_at")
+    tabs = [t for t in old.get("tabs") or [] if t not in gone]
+    tabs += [t["id"] for t in record["tabs"] if t["id"] not in tabs]
+    entry = {"kind": "doc", "title": title, "org": record.get("org") or old.get("org"),
+             "tabs": tabs, "created_at": created,
+             "fetched_at": old["fetched_at"] if force and old.get("version") == version else now_iso(),
+             "version": version, "file": document_relpath(doc, title, created)}
+    if gone:
+        entry["deleted_tabs"] = gone
+    if old.get("org_mode_id"):
+        entry["org_mode_id"] = old["org_mode_id"]
+    write_atomic(os.path.join(DOCS_RAW, f"{doc}.json"), dump(record))
+    write_atomic(os.path.join(OUTPUT, entry["file"]), DOCUMENT_RENDERERS[FORMAT](record, entry))
+    if old.get("file") and old["file"] != entry["file"]:
+        stale = os.path.join(OUTPUT, old["file"])
+        if os.path.exists(stale):
+            os.remove(stale)  # renamed doc; documents/ history keeps the old version
+    docs[doc] = entry
+    # Links show the doc's title and path, so a first fetch or a rename
+    # changes the files of the chats that link to it.
+    if (old.get("file"), old.get("title")) != (entry["file"], entry["title"]):
+        rerender_conversations(doc, index, docs)
+    return True
+
+
+def mark_missing(doc: str, docs: dict) -> None:
+    """Record that claude.ai no longer finds a doc; its local copy is kept."""
+    if not UUID.fullmatch(doc):
+        raise ValueError(f"not a doc ID: {doc!r}")
+    docs.setdefault(doc, {"kind": "doc"}).setdefault("missing_since", now_iso())
+
+
+def documents_to_check(index: dict, docs: dict, now: float) -> dict:
+    """The docs the extension should fetch, with what it needs to fetch them.
+
+    That is every doc a stored chat refers to whose organization and tabs are
+    known, except one that claude.ai has not found for MISSING_DAYS. A doc
+    without a version is sent whatever it holds: one never fetched, or one
+    that went missing and may come back unchanged.
+    """
+    refs = {doc for entry in index.values() for doc in entry.get("documents") or []}
+    out = {}
+    for doc in sorted(refs | set(docs)):
+        entry = docs.get(doc) or {}
+        missing = entry.get("missing_since")
+        if not entry.get("org") or not entry.get("tabs") or (
+                missing and now - to_epoch(missing) > MISSING_DAYS * 86400):
+            continue
+        out[doc] = {"org": entry["org"], "tabs": entry["tabs"],
+                    "version": None if missing else entry.get("version")}
+    return out
+
+
+def backfill_document_refs() -> None:
+    """Give chats stored before docs were synced their "documents" entries.
+
+    Run when the listener starts; the next sync then fetches their docs.
+    """
+    index = load_index()
+    todo = [cid for cid, entry in index.items() if "documents" not in entry]
+    if not todo:
+        return
+    docs = load_documents()
+    for cid in todo:
+        with open(raw_path(cid), encoding="utf-8") as f:
+            conv = json.load(f)
+        note_document_refs(conv, index[cid].get("org"), docs)
+        index[cid]["documents"] = sorted(document_refs(conv))
+    save_documents(docs)
+    save_index(index)
 
 
 # ------------------------------------------------------------------ store
@@ -514,12 +863,13 @@ def ensure_data_repo() -> None:
         write_atomic(ignore, "".join(f"/{f}\n" for f in FORMATS))
 
 
-def store(conv: dict, meta: dict | None, index: dict, force: bool = False) -> bool:
+def store(conv: dict, meta: dict | None, index: dict, docs: dict, force: bool = False) -> bool:
     """Save one conversation's raw JSON and rendered file. Return True if written.
 
     `meta` is the conversation's entry in the app's conversation list, plus
     its organization; `conv` is the conversation as fetched (or exported),
-    with claude-sync's own fields under "_claude_sync".
+    with claude-sync's own fields under "_claude_sync". `docs` (the
+    documents index) is only read, to link the docs the chat refers to.
     """
     cid = conv_id(conv)
     meta = meta or {}
@@ -560,12 +910,13 @@ def store(conv: dict, meta: dict | None, index: dict, force: bool = False) -> bo
         "is_archived": bool(field("is_archived")),
         "source": ours.get("source", "api"),
         "fetched_at": old.get("fetched_at") if old and force else now_iso(),
+        "documents": sorted(document_refs(conv)),
     }
     entry["file"] = output_relpath(entry, cid)
     if old and old.get("org_mode_id"):
         entry["org_mode_id"] = old["org_mode_id"]
     write_atomic(raw_path(cid), dump(conv))
-    write_atomic(os.path.join(OUTPUT, entry["file"]), render(conv, entry))
+    write_atomic(os.path.join(OUTPUT, entry["file"]), render(conv, entry, docs))
     if old and old.get("file") and old["file"] != entry["file"]:
         stale = os.path.join(OUTPUT, old["file"])
         if os.path.exists(stale):
@@ -578,7 +929,7 @@ def listing_meta(item: dict) -> dict:
     return {k: item[k] for k in LISTING_FIELDS + ("org",) if k in item}
 
 
-def update_listing(listing: list, index: dict) -> list:
+def update_listing(listing: list, index: dict, docs: dict) -> list:
     """Apply list-only changes (renames, stars, project moves) to stored chats."""
     changed = []
     for item in listing:
@@ -587,7 +938,7 @@ def update_listing(listing: list, index: dict) -> list:
         if entry and any(k in item and entry.get(k) != item[k] for k in LISTING_FIELDS):
             with open(raw_path(cid), encoding="utf-8") as f:
                 conv = json.load(f)
-            store(conv, listing_meta(item), index, force=True)
+            store(conv, listing_meta(item), index, docs, force=True)
             changed.append(cid)
     return changed
 
@@ -602,7 +953,10 @@ def save_cowork(cowork: dict) -> bool:
 
 
 def git_commit(message: str, cowork_changed: bool = False) -> str | None:
-    paths = ["raw", "index.json"]
+    # git refuses a pathspec that matches nothing, as documents/ does until
+    # the first doc is stored.
+    paths = [p for p in ("raw", "index.json", "documents", "documents.json")
+             if os.path.exists(os.path.join(DATA, p))]
     if cowork_changed:
         # Only a changed list is committed, not each new fetched_at.
         paths.append(os.path.join("cowork", "sessions.json"))
@@ -670,6 +1024,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply(200, {"ids": ids,
                                      "orgs": CONFIG.get("orgs"),
                                      "extension_code": disk})
+        if url.path == "/documents":
+            with LOCK:
+                checks = documents_to_check(load_index(), load_documents(), dt.datetime.now().timestamp())
+            return self._reply(200, {"documents": checks})
         self._reply(404, {"error": "not found"})
 
     def do_POST(self):
@@ -681,24 +1039,38 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/conversations":
                 with LOCK:
                     index = load_index()
+                    docs = load_documents()
                     written = 0
                     for item in payload["items"]:
                         conv = item["conversation"]
                         conv["_claude_sync"] = {"org": item["org"], "source": "api"}
                         meta = dict(item.get("meta") or {}, org=item["org"])
-                        written += store(conv, meta, index)
+                        note_document_refs(conv, item["org"], docs)
+                        written += store(conv, meta, index, docs)
+                    save_documents(docs)
                     save_index(index)
                 return self._reply(200, {"written": written})
+            if self.path == "/documents":
+                with LOCK:
+                    index = load_index()
+                    docs = load_documents()
+                    written = [d["id"] for d in payload.get("documents") or []
+                               if store_document(d, docs, index)]
+                    for doc in payload.get("missing") or []:
+                        mark_missing(doc, docs)
+                    save_documents(docs)
+                return self._reply(200, {"written": len(written)})
             if self.path == "/sync-done":
                 with LOCK:
                     index = load_index()
-                    changed = update_listing(payload.get("listing") or [], index)
+                    changed = update_listing(payload.get("listing") or [], index, load_documents())
                     save_index(index)
                     cowork = payload.get("cowork")
                     cowork_changed = save_cowork(cowork) if cowork is not None else False
                     s = payload.get("summary") or {}
                     commit = git_commit(
-                        f"sync: {s.get('fetched', 0)} fetched, {len(changed)} list changes"
+                        f"sync: {s.get('fetched', 0)} fetched, {len(changed)} list changes, "
+                        f"{s.get('documents', 0)} documents"
                         + (f", {len(cowork['sessions'])} Cowork sessions" if cowork_changed else ""),
                         cowork_changed)
                 record = {"at": now_iso(), "summary": s, "listing_changes": len(changed),
@@ -715,6 +1087,7 @@ class Handler(BaseHTTPRequestHandler):
 def make_server(port: int) -> ThreadingHTTPServer:
     require_pandoc()
     ensure_data_repo()
+    backfill_document_refs()
     os.makedirs(STATE_DIR, exist_ok=True)
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
@@ -756,11 +1129,11 @@ def read_export(paths: list) -> list:
     return convs
 
 
-def parallel_store(convs: list, index: dict, force: bool) -> int:
+def parallel_store(convs: list, index: dict, docs: dict, force: bool) -> int:
     # Rendering dominates; index updates happen on the main thread afterwards.
     def work(conv):
         local = {conv_id(conv): index[conv_id(conv)]} if conv_id(conv) in index else {}
-        return local if store(conv, None, local, force) else None
+        return local if store(conv, None, local, docs, force) else None
     n = 0
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
         for result in pool.map(work, convs):
@@ -779,9 +1152,12 @@ def cmd_import(args) -> None:
         # The app's copy has the full message tree; never replace it with the
         # export's. A later sync fetches anything changed since.
         todo = [c for c in convs if (index.get(c["uuid"]) or {}).get("source") != "api"]
+        docs = load_documents()
         for conv in todo:
             conv["_claude_sync"] = {"org": args.org, "source": "export"}
-        n = parallel_store(todo, index, force=False)
+            note_document_refs(conv, args.org, docs)
+        n = parallel_store(todo, index, docs, force=False)
+        save_documents(docs)
         save_index(index)
         commit = git_commit(f"import: {n} of {len(convs)} conversations from official export")
     print(f"{len(convs)} in export, {n} new or newer, commit {commit}")
@@ -791,13 +1167,22 @@ def cmd_render(args) -> None:
     require_pandoc()
     with LOCK:
         index = load_index()
+        docs = load_documents()
         convs = []
         for cid in index:
             with open(raw_path(cid), encoding="utf-8") as f:
                 convs.append(json.load(f))
-        n = parallel_store(convs, index, force=True)
+            note_document_refs(convs[-1], index[cid].get("org"), docs)
+        stored = 0
+        for doc in list(docs):
+            path = os.path.join(DOCS_RAW, f"{doc}.json")
+            if os.path.exists(path):  # not so for a doc never fetched
+                with open(path, encoding="utf-8") as f:
+                    stored += store_document(json.load(f), docs, index, force=True)
+        save_documents(docs)
+        n = parallel_store(convs, index, docs, force=True)
         save_index(index)
-    print(f"re-rendered {n} conversations as {FORMAT} in {OUTPUT}")
+    print(f"re-rendered {n} conversations and {stored} documents as {FORMAT} in {OUTPUT}")
 
 
 def cmd_status(args) -> None:
@@ -810,6 +1195,9 @@ def cmd_status(args) -> None:
     print(f"{len(index)} conversations ({sum(e['is_archived'] for e in index.values())} archived)")
     for org, n in sorted(by_org.items()):
         print(f"  {n:6d}  {org}")
+    docs = load_documents()
+    print(f"{sum(1 for d in docs.values() if d.get('file'))} of {len(docs)} documents stored"
+          f" ({sum(1 for d in docs.values() if d.get('missing_since'))} missing in claude.ai)")
     cowork = load_json(COWORK, None)
     if cowork:
         print(f"{len(cowork['sessions'])} Cowork sessions (listed {cowork['fetched_at']})")
