@@ -72,6 +72,10 @@ them to a companion program on the user's own computer.
 
 - `alarms`: schedules the sync that runs every 30 minutes while Chrome is
   open.
+- `declarativeNetRequestWithHostAccess`: sets the `Origin` header of the
+  extension's own Claude Docs export requests to claude.ai, the value
+  claude.ai's pages send, without which claude.ai refuses them. It changes no
+  other request.
 - `storage`: keeps the extension's own status (time of the last sync, the
   last error) for the toolbar popup. No conversation content is stored.
 - Host permission `https://claude.ai/*`: reads the user's own conversations,
