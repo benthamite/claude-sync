@@ -142,7 +142,12 @@ async function api(path, headers = {}, body = undefined) {
       await wakefulSleep(wait * 1000, `rate limited; waiting ${wait}s`);
       continue;
     }
-    if (!r.ok) throw Object.assign(new Error(`${path.split('?')[0]}: HTTP ${r.status}`), {status: r.status});
+    if (!r.ok) {
+      // claude.ai's error bodies are short JSON naming the reason; keep the start.
+      const detail = (await r.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 300);
+      throw Object.assign(new Error(`${path.split('?')[0]}: HTTP ${r.status}` + (detail ? ` ${detail}` : '')),
+                          {status: r.status});
+    }
     return awaitWithHeartbeat(r.json());
   }
 }
