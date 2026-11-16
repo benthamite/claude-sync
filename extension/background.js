@@ -274,23 +274,41 @@ async function listCowork(orgs) {
 const FRAME_HEADERS = {'X-Frame-CP': 'go'};
 const LOOKUP_BATCH = 50;  // doc IDs per metadata lookup
 
-// claude.ai refuses a Claude Docs export (a POST) from the extension: HTTP 401
-// with the extension's Origin, as every request this worker makes has, and
-// 403 with claude.ai's Origin but no Referer; its GETs don't check. This
-// session rule gives the extension's own export calls, and nothing else, the
-// Origin and Referer claude.ai's pages send.
-async function setExportOrigin() {
-  await chrome.declarativeNetRequest.updateSessionRules({
-    removeRuleIds: [1],
-    addRules: [{
-      id: 1,
-      action: {type: 'modifyHeaders',
-               requestHeaders: [{header: 'Origin', operation: 'set', value: CLAUDE},
-                                {header: 'Referer', operation: 'set', value: `${CLAUDE}/`}]},
-      condition: {urlFilter: `|${CLAUDE}/api/frame/mcp/call`, initiatorDomains: [chrome.runtime.id],
-                  requestMethods: ['post'], resourceTypes: ['xmlhttprequest']},
-    }],
-  });
+// claude.ai refuses a Claude Docs export (a POST) made by the extension
+// itself: 401, or 403 even with claude.ai's Origin and Referer set. It accepts
+// one made from a claude.ai page, so a doc's boot and export requests run in
+// an open claude.ai tab of this profile (the lookup, a GET, runs here).
+async function claudeTab() {
+  const tabs = await chrome.tabs.query({url: `${CLAUDE}/*`, status: 'complete'});
+  const tab = tabs.find((t) => !t.discarded);
+  if (!tab) throw new Error('no claude.ai tab open in this Chrome profile; Claude Docs sync again ' +
+                            'on the first run with one open');
+  return tab.id;
+}
+
+// The api() request, made from the page in `tabId`.
+async function pageApi(tabId, path, headers = {}, body = undefined) {
+  const [{result}] = await awaitWithHeartbeat(chrome.scripting.executeScript({
+    target: {tabId},
+    world: 'MAIN',
+    args: [path, headers, body === undefined ? null : JSON.stringify(body)],
+    func: async (path, headers, body) => {
+      const r = await fetch(path, {
+        method: body === null ? 'GET' : 'POST',
+        headers: body === null ? headers : {...headers, 'Content-Type': 'application/json'},
+        body: body === null ? undefined : body,
+        credentials: 'include',
+      });
+      return {status: r.status, text: await r.text()};
+    },
+  }));
+  if (!result) throw new Error(`${path.split('?')[0]}: the claude.ai tab returned nothing`);
+  if (result.status < 200 || result.status > 299) {
+    const detail = result.text.replace(/\s+/g, ' ').slice(0, 300);
+    throw Object.assign(new Error(`${path.split('?')[0]}: HTTP ${result.status} ${detail}`),
+                        {status: result.status});
+  }
+  return JSON.parse(result.text);
 }
 
 // The JSON an export call returns, from the tool result's text blocks (one
@@ -327,9 +345,16 @@ function sameVersion(a, b) {
 // revisions differ from the stored version is sent to the listener.
 async function syncDocuments(summary, errors) {
   await stage('checking documents');
-  await setExportOrigin();
   const {documents} = await server('GET', '/documents');
   const ids = Object.keys(documents);
+  if (!ids.length) return;
+  let tabId;
+  try {
+    tabId = await claudeTab();
+  } catch (e) {
+    errors.push(`documents: ${e.message}`);
+    return;
+  }
   const byOrg = new Map();
   for (const id of ids) byOrg.set(documents[id].org, [...(byOrg.get(documents[id].org) || []), id]);
   let batch = [];
@@ -356,7 +381,7 @@ async function syncDocuments(summary, errors) {
       try {
         let page;
         try {
-          page = await api(`/api/frame/${id}?${q}`, FRAME_HEADERS);
+          page = await pageApi(tabId, `/api/frame/${id}?${q}`, FRAME_HEADERS);
         } catch (e) {
           // A deleted doc, or one no longer shared with this account, answers
           // 404. The listener keeps the local copy.
@@ -371,7 +396,7 @@ async function syncDocuments(summary, errors) {
         const deletedTabs = [];
         for (const tab of documents[id].tabs) {
           await sleep(FETCH_GAP_MS);
-          const res = await api(`/api/frame/mcp/call?${q}`, FRAME_HEADERS, {
+          const res = await pageApi(tabId, `/api/frame/mcp/call?${q}`, FRAME_HEADERS, {
             slug: id, server: 'Claude Docs', tool: 'export', mcpToken: token,
             input: {container: {id, kind: 'project'}, file: tab, format: 'markdown'},
           });

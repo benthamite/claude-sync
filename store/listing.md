@@ -72,10 +72,10 @@ them to a companion program on the user's own computer.
 
 - `alarms`: schedules the sync that runs every 30 minutes while Chrome is
   open.
-- `declarativeNetRequestWithHostAccess`: sets the `Origin` and `Referer` headers of the
-  extension's own Claude Docs export requests to claude.ai, the value
-  claude.ai's pages send, without which claude.ai refuses them. It changes no
-  other request.
+- `scripting`: makes the extension's Claude Docs requests from an open
+  claude.ai tab, because claude.ai accepts them only from its own pages. The
+  injected function only makes that request and returns the response; it
+  reads nothing from the page.
 - `storage`: keeps the extension's own status (time of the last sync, the
   last error) for the toolbar popup. No conversation content is stored.
 - Host permission `https://claude.ai/*`: reads the user's own conversations,

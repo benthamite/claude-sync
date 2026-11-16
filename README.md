@@ -48,7 +48,8 @@ tool calls. claude-sync stores each such doc separately, renders it to its own
 file under `documents/`, and ends the chat's file with a *Documents* section
 linking to it. A doc can change after its chat ends, so every sync reads each
 doc again and stores the ones that changed. Docs you delete in claude.ai are
-kept locally.
+kept locally. Docs sync only while a claude.ai tab is open in the same Chrome
+profile (see below).
 
 If your login belongs to several organizations (say a personal one and a Team
 one), chats from every organization with chats are synced, each recorded with
@@ -138,7 +139,11 @@ the file to resume.
   each doc as its own page in claude.ai exports it: the doc's page metadata
   (`/api/frame/<uuid>`) grants a short-lived token for the Claude Docs
   `export` tool (`/api/frame/mcp/call`), which returns one tab as Markdown with
-  its revision number. Titles come from `/api/frame/artifacts`. A doc whose
+  its revision number. claude.ai refuses that export when the extension makes
+  it, even with claude.ai's `Origin` and `Referer`, and accepts it from its own
+  pages, so the doc's metadata and export requests run in an open claude.ai
+  tab (`chrome.scripting`); with none open, the run reports it and leaves docs
+  for the next run. Titles come from `/api/frame/artifacts`. A doc whose
   title or tab revisions changed is sent to the listener. A doc that answers
   404 (deleted, or no longer shared with you) is checked for 30 days, then no
   longer.
@@ -222,6 +227,7 @@ stable:
 - Of the documents a chat creates, only Claude Docs are synced. Other
   artifacts (pages Claude publishes, and the artifacts of older chats, whose
   content and edits are tool calls in the chat) show only as tool calls.
+- Docs sync only on runs with a claude.ai tab open in the same Chrome profile.
 - A doc's tabs are found in the chats' tool calls; a tab added in claude.ai
   itself, outside any synced chat, is not fetched.
 - Each sync spends one request per doc and one per tab to check them, so
