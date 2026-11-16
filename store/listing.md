@@ -72,7 +72,7 @@ them to a companion program on the user's own computer.
 
 - `alarms`: schedules the sync that runs every 30 minutes while Chrome is
   open.
-- `declarativeNetRequestWithHostAccess`: sets the `Origin` header of the
+- `declarativeNetRequestWithHostAccess`: sets the `Origin` and `Referer` headers of the
   extension's own Claude Docs export requests to claude.ai, the value
   claude.ai's pages send, without which claude.ai refuses them. It changes no
   other request.

@@ -274,17 +274,19 @@ async function listCowork(orgs) {
 const FRAME_HEADERS = {'X-Frame-CP': 'go'};
 const LOOKUP_BATCH = 50;  // doc IDs per metadata lookup
 
-// claude.ai answers a Claude Docs export (a POST) with HTTP 401 when its
-// Origin is the extension's, as it is for every request this worker makes;
-// its GETs don't check. This session rule gives the extension's own export
-// calls, and nothing else, the Origin claude.ai's pages send.
+// claude.ai refuses a Claude Docs export (a POST) from the extension: HTTP 401
+// with the extension's Origin, as every request this worker makes has, and
+// 403 with claude.ai's Origin but no Referer; its GETs don't check. This
+// session rule gives the extension's own export calls, and nothing else, the
+// Origin and Referer claude.ai's pages send.
 async function setExportOrigin() {
   await chrome.declarativeNetRequest.updateSessionRules({
     removeRuleIds: [1],
     addRules: [{
       id: 1,
       action: {type: 'modifyHeaders',
-               requestHeaders: [{header: 'Origin', operation: 'set', value: CLAUDE}]},
+               requestHeaders: [{header: 'Origin', operation: 'set', value: CLAUDE},
+                                {header: 'Referer', operation: 'set', value: `${CLAUDE}/`}]},
       condition: {urlFilter: `|${CLAUDE}/api/frame/mcp/call`, initiatorDomains: [chrome.runtime.id],
                   requestMethods: ['post'], resourceTypes: ['xmlhttprequest']},
     }],
